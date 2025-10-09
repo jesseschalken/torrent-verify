@@ -202,8 +202,8 @@ fn read_torrents(torrents: Vec<Utf8PathBuf>) -> Result<Vec<(Utf8PathBuf, Torrent
         .par_bridge()
         .map(|path| {
             let bytes = fs::read(&path)?;
-            let (bencode, _) = Bencode::decode(&fs::read(&path)?)?;
-            let mut torrent: Torrent = bencode.try_into()?;
+            let (value, _) = Bencode::decode(&bytes)?;
+            let mut torrent: Torrent = value.try_into()?;
             torrent.fix_windows_paths();
             torrent.normalize_utf8_paths();
             Ok((path, torrent))
