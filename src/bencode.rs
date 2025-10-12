@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::io;
 use std::io::Write;
@@ -9,7 +9,7 @@ pub enum Bencode {
     Int(i64),
     Bytes(Vec<u8>),
     List(Vec<Bencode>),
-    Dict(HashMap<Vec<u8>, Bencode>),
+    Dict(BTreeMap<Vec<u8>, Bencode>),
 }
 
 type BoxedError = Box<dyn std::error::Error + Send + Sync>;
@@ -57,7 +57,7 @@ impl Bencode {
         }
     }
 
-    pub fn try_into_dict(self) -> Result<HashMap<Vec<u8>, Bencode>, String> {
+    pub fn try_into_dict(self) -> Result<BTreeMap<Vec<u8>, Bencode>, String> {
         match self {
             Bencode::Dict(x) => Ok(x),
             _ => Err(format!("Expected a dict, got {}", self.get_type())),
@@ -107,7 +107,7 @@ where
     }
 }
 
-impl TryFrom<Bencode> for HashMap<Vec<u8>, Bencode> {
+impl TryFrom<Bencode> for BTreeMap<Vec<u8>, Bencode> {
     type Error = String;
     fn try_from(value: Bencode) -> Result<Self, Self::Error> {
         value.try_into_dict()
@@ -174,7 +174,7 @@ impl Bencode {
             }
             [b'd', rest @ ..] => {
                 let mut rest = rest;
-                let mut dict = HashMap::new();
+                let mut dict = BTreeMap::new();
                 loop {
                     if let [b'e', rest @ ..] = rest {
                         break Ok((Bencode::Dict(dict), rest));
