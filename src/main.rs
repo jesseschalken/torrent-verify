@@ -6,14 +6,14 @@ use camino::{Utf8Path, Utf8PathBuf};
 use clap::clap_derive::Subcommand;
 use clap::Parser;
 use itertools::Itertools;
-use rayon::iter::{ParallelBridge, ParallelIterator};
-use rayon::prelude::IntoParallelRefIterator;
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use sha1::{Digest, Sha1};
 use std::collections::HashSet;
 use std::fmt::{Debug, Display, Formatter};
 use std::fs::File;
 use std::io::{ErrorKind, Read};
 use std::iter::once;
+use std::path::Path;
 use std::{fs, io};
 use unicode_normalization::UnicodeNormalization;
 
@@ -40,10 +40,15 @@ struct JustTorrents {
 
 #[derive(Subcommand, Debug)]
 enum Subcommand {
+    #[command(about = "Verify downloaded torrent data")]
     VerifyData(TorrentsAndData),
+    #[command(about = "List files in the data directory that don't belong to a torrent file")]
     ShowOrphaned(TorrentsAndData),
+    #[command(about = "List files for each torrent that are missing in the data directory")]
     ShowMissing(TorrentsAndData),
+    #[command(about = "Dump information about the provided torrent files")]
     Dump(JustTorrents),
+    #[command(about = "Get the info-hash of each provided torrent file")]
     GetInfoHash(JustTorrents),
 }
 
@@ -197,9 +202,8 @@ fn read_torrents(torrents: Vec<Utf8PathBuf>) -> Result<Vec<(Utf8PathBuf, Torrent
             }
         })
         .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
+        .into_par_iter()
         .flatten()
-        .par_bridge()
         .map(|path| {
             let bytes = fs::read(&path)?;
             let (value, _) = Bencode::decode(&bytes)?;
@@ -211,45 +215,75 @@ fn read_torrents(torrents: Vec<Utf8PathBuf>) -> Result<Vec<(Utf8PathBuf, Torrent
         .collect()
 }
 
-fn read_torrent_files(torrent: &Torrent, data_dir: &Utf8Path) -> Result<Vec<Sha1Hash>, Error> {
-    let mut results = Vec::with_capacity(torrent.pieces.len());
+struct Zeros;
 
-    let mut buffer = Vec::new();
-    buffer.resize(torrent.piece_size, 0);
+impl Read for Zeros {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        output.fill(0);
+        Ok(output.len())
+    }
+}
 
-    let mut buf_pos = 0usize;
+fn open_if_exists(path: &Path) -> io::Result<Option<File>> {
+    match File::open(path) {
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        x => Ok(Some(x?)),
+    }
+}
 
-    for (path, file_size) in &torrent.files {
-        let mut file_pos = 0usize;
-        let mut file_handle = match File::open(data_dir.join(path)) {
-            Err(e) if e.kind() == ErrorKind::NotFound => None,
-            x => Some(x?),
-        };
+struct MaybeRead<T>(Option<T>);
 
-        while file_pos < *file_size {
-            let piece_len = buffer.len();
-            let file_remaining = file_size - file_pos;
-            let output_range = &mut buffer[buf_pos..(buf_pos + file_remaining).min(piece_len)];
+impl<T: Read> Read for MaybeRead<T> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.as_mut().map_or(Ok(0), |x| x.read(buf))
+    }
+}
 
-            if let Some(f) = &mut file_handle {
-                let bytes_read = f.read(output_range)?;
-                if bytes_read == 0 {
-                    // EOF
-                    file_handle = None;
-                }
-                buf_pos += bytes_read;
-                file_pos += bytes_read;
-            } else {
-                // no file to read, just fill with zeros
-                output_range.fill(0);
-                buf_pos += output_range.len();
-                file_pos += output_range.len();
-            };
+struct ConcatReader<R, I>(Option<R>, I);
 
-            if buf_pos == buffer.len() {
-                results.push(Sha1Hash::hash(&buffer));
-                buf_pos = 0;
+impl<R: Read, I: Iterator<Item = io::Result<R>>> ConcatReader<R, I> {
+    fn new(tail: I) -> Self {
+        Self(None, tail)
+    }
+}
+
+impl<R: Read, I: Iterator<Item = io::Result<R>>> Read for ConcatReader<R, I> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let ConcatReader(head, tail) = self;
+        loop {
+            if head.is_none() {
+                *head = tail.next().transpose()?
             }
+            match head {
+                None => break Ok(0),
+                Some(read) => match read.read(buf)? {
+                    0 if !buf.is_empty() => *head = None,
+                    n => break Ok(n),
+                },
+            }
+        }
+    }
+}
+
+fn read_torrent_files(torrent: &Torrent, data_dir: &Utf8Path) -> io::Result<Vec<Sha1Hash>> {
+    let mut results = Vec::with_capacity(torrent.pieces.len());
+    let mut buffer = vec![0; torrent.piece_size].into_boxed_slice();
+
+    let mut reader = ConcatReader::new(torrent.files.iter().map(|(path, file_size)| {
+        let file = open_if_exists(data_dir.join(path).as_ref())?;
+        Ok(MaybeRead(file).chain(Zeros).take(*file_size as u64))
+    }));
+
+    let mut buf_pos = 0;
+    loop {
+        let n = reader.read(&mut buffer[buf_pos..])?;
+        if n == 0 {
+            break;
+        }
+        buf_pos += n;
+        if buf_pos == buffer.len() {
+            results.push(Sha1Hash::hash(&buffer));
+            buf_pos = 0;
         }
     }
 
@@ -267,7 +301,8 @@ fn check_file_contents(
     data_dir: &Utf8Path,
 ) -> Result<(), Error> {
     torrents
-        .par_iter()
+        .into_par_iter()
+        .with_max_len(1)
         .map(|(name, torrent)| -> Result<_, _> {
             let any_files_exist = torrent
                 .files
@@ -299,27 +334,32 @@ fn check_file_contents(
         .collect()
 }
 
-const CHARS: &'static [char] = &['○', '●'];
-// const CHARS: &'static [char] = &['○', '◒', '●'];
-// const CHARS: &'static [char] = &['○', '◔', '◑', '◕', '●'];
-// const CHARS: &'static [char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+const CHARS: [char; 3] = ['○', '◒', '●'];
 
 fn char_for(bools: &[bool]) -> char {
-    let num = bools.iter().filter(|x| **x).count();
-    CHARS[num * (CHARS.len() - 1) / bools.len()]
+    let [empty, partial, complete] = CHARS;
+    match bools.iter().filter(|x| **x).count() {
+        x if x == bools.len() => complete,
+        0 => empty,
+        _ => partial,
+    }
 }
 
 fn compress(bools: &[bool], size: usize) -> Vec<&[bool]> {
-    let factor = bools.len() as f64 / size as f64;
+    let mut last_end = 0;
     (0..size)
-        .map(|i| {
-            let i1 = (i as f64 * factor) as usize;
-            let i2 = ((i + 1) as f64 * factor) as usize;
-            if i1 == i2 {
-                &bools[i1..=i2]
-            } else {
-                &bools[i1..i2]
+        .map(|index| {
+            let mut start = last_end;
+            let mut end = ((index + 1) * bools.len()) / size;
+            last_end = end;
+            if start == end {
+                if end < bools.len() {
+                    end += 1;
+                } else if start > 0 {
+                    start -= 1;
+                }
             }
+            &bools[start..end]
         })
         .collect()
 }

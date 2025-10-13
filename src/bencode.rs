@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::error::Error;
 use std::fmt::Display;
 use std::io;
 use std::io::Write;
@@ -12,17 +13,14 @@ pub enum Bencode {
     Dict(BTreeMap<Vec<u8>, Bencode>),
 }
 
-type BoxedError = Box<dyn std::error::Error + Send + Sync>;
+type BoxedError = Box<dyn Error + Send + Sync>;
 
 impl Bencode {
     pub fn remove_key<S: AsRef<[u8]> + Display>(&mut self, key: S) -> Result<Bencode, String> {
         match self {
-            Bencode::Dict(dict) => {
-                if let Some(value) = dict.remove(key.as_ref()) {
-                    return Ok(value);
-                }
-                Err(format!("Key '{key}' not found"))
-            }
+            Bencode::Dict(dict) => dict
+                .remove(key.as_ref())
+                .ok_or_else(|| format!("Key '{key}' not found")),
             _ => Err(format!("Expected a dict, got {}", self.get_type())),
         }
     }
@@ -130,7 +128,7 @@ impl Bencode {
                 out.write(&[b'e'])?;
             }
             Bencode::Bytes(x) => {
-                dump_string(out, &x)?;
+                dump_string(out, x)?;
             }
             Bencode::List(x) => {
                 out.write(&[b'l'])?;
@@ -152,37 +150,38 @@ impl Bencode {
 
     pub fn decode(bytes: &[u8]) -> Result<(Bencode, &[u8]), BoxedError> {
         match bytes {
-            [b'i', rest @ ..] => {
-                let (int, rest) = split_at_byte(rest, b'e')?;
-                Ok((Bencode::Int(from_utf8(int)?.parse()?), rest))
+            [b'i', bytes @ ..] => {
+                let (int, bytes) = split_at_byte(bytes, b'e')?;
+                Ok((Bencode::Int(from_utf8(int)?.parse()?), bytes))
             }
             bytes @ [b'0'..=b'9', ..] => {
-                let (string, rest) = decode_string(bytes)?;
-                Ok((Bencode::Bytes(string.to_vec()), rest))
+                let (string, bytes) = decode_string(bytes)?;
+                Ok((Bencode::Bytes(string.to_vec()), bytes))
             }
-            [b'l', rest @ ..] => {
-                let mut rest = rest;
+            [b'l', bytes @ ..] => {
+                let mut bytes = bytes;
                 let mut list = Vec::new();
                 loop {
-                    if let [b'e', rest @ ..] = rest {
-                        break Ok((Bencode::List(list), rest));
+                    if let [b'e', bytes @ ..] = bytes {
+                        break Ok((Bencode::List(list), bytes));
                     }
-                    let (value, rest2) = Bencode::decode(rest)?;
+                    let value;
+                    (value, bytes) = Bencode::decode(bytes)?;
                     list.push(value);
-                    rest = rest2;
                 }
             }
-            [b'd', rest @ ..] => {
-                let mut rest = rest;
+            [b'd', bytes @ ..] => {
+                let mut bytes = bytes;
                 let mut dict = BTreeMap::new();
                 loop {
-                    if let [b'e', rest @ ..] = rest {
-                        break Ok((Bencode::Dict(dict), rest));
+                    if let [b'e', bytes @ ..] = bytes {
+                        break Ok((Bencode::Dict(dict), bytes));
                     }
-                    let (key, rest2) = decode_string(rest)?;
-                    let (value, rest2) = Bencode::decode(rest2)?;
-                    dict.insert(key.to_vec(), value);
-                    rest = rest2;
+                    let key;
+                    let val;
+                    (key, bytes) = decode_string(bytes)?;
+                    (val, bytes) = Bencode::decode(bytes)?;
+                    dict.insert(key.to_vec(), val);
                 }
             }
             [byte, ..] => Err(format!("Unexpected byte '{byte}'"))?,
@@ -192,17 +191,19 @@ impl Bencode {
 }
 
 fn split_at_byte(bytes: &[u8], byte: u8) -> Result<(&[u8], &[u8]), BoxedError> {
-    if let Some(index) = bytes.iter().position(|x| *x == byte) {
-        return Ok((&bytes[..index], &bytes[(index + 1)..]));
-    }
-    Err(format!("Missing byte '{byte}'"))?
+    let index = bytes
+        .into_iter()
+        .position(|x| *x == byte)
+        .ok_or_else(|| format!("Missing byte '{byte}'"))?;
+
+    Ok((&bytes[..index], &bytes[(index + 1)..]))
 }
 
 fn decode_string(bytes: &[u8]) -> Result<(&[u8], &[u8]), BoxedError> {
-    let (length, rest) = split_at_byte(bytes, b':')?;
+    let (length, bytes) = split_at_byte(bytes, b':')?;
     let mid: usize = from_utf8(length)?.parse()?;
-    if mid <= rest.len() {
-        return Ok(rest.split_at(mid));
+    if mid <= bytes.len() {
+        return Ok(bytes.split_at(mid));
     }
     Err(format!("String length {mid} exceeds remaining bytes"))?
 }
