@@ -16,7 +16,7 @@ pub enum Bencode {
 type BoxedError = Box<dyn Error + Send + Sync>;
 
 impl Bencode {
-    pub fn remove_key<S: AsRef<[u8]> + Display>(&mut self, key: S) -> Result<Bencode, String> {
+    pub fn remove_key(&mut self, key: impl AsRef<[u8]> + Display) -> Result<Bencode, String> {
         match self {
             Bencode::Dict(dict) => dict
                 .remove(key.as_ref())
