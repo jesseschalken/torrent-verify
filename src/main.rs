@@ -346,20 +346,16 @@ fn char_for(bools: &[bool]) -> char {
 }
 
 fn compress(bools: &[bool], size: usize) -> Vec<&[bool]> {
-    let mut last_end = 0;
     (0..size)
-        .map(|index| {
-            let mut start = last_end;
-            let mut end = ((index + 1) * bools.len()) / size;
-            last_end = end;
-            if start == end {
-                if end < bools.len() {
-                    end += 1;
-                } else if start > 0 {
-                    start -= 1;
-                }
+        .map(|i| {
+            let [i, j] = [i, i + 1].map(|i| (i * bools.len()) / size);
+            if i == j && j < bools.len() {
+                &bools[i..j + 1]
+            } else if i == j && i > 0 {
+                &bools[i - 1..j]
+            } else {
+                &bools[i..j]
             }
-            &bools[start..end]
         })
         .collect()
 }
