@@ -29,7 +29,7 @@ struct Cli {
 #[derive(Parser, Debug)]
 struct TorrentsAndData {
     torrent_files: Vec<Utf8PathBuf>,
-    #[arg(short, long)]
+    #[arg(short, long = "data")]
     data_dir: Utf8PathBuf,
 }
 
@@ -41,15 +41,15 @@ struct JustTorrents {
 #[derive(Subcommand, Debug)]
 enum Subcommand {
     #[command(about = "Verify downloaded torrent data")]
-    VerifyData(TorrentsAndData),
+    Verify(TorrentsAndData),
     #[command(about = "List files in the data directory that don't belong to a torrent file")]
-    ShowOrphaned(TorrentsAndData),
+    Unowned(TorrentsAndData),
     #[command(about = "List files for each torrent that are missing in the data directory")]
-    ShowMissing(TorrentsAndData),
+    Missing(TorrentsAndData),
     #[command(about = "Dump information about the provided torrent files")]
     Dump(JustTorrents),
     #[command(about = "Get the info-hash of each provided torrent file")]
-    GetInfoHash(JustTorrents),
+    InfoHash(JustTorrents),
 }
 
 #[derive(Debug)]
@@ -364,11 +364,11 @@ fn main() -> Result<(), Error> {
     let cli = Cli::parse();
 
     match cli.command {
-        Subcommand::VerifyData(args) => {
+        Subcommand::Verify(args) => {
             let torrents = read_torrents(args.torrent_files)?;
             check_file_contents(&torrents, &args.data_dir)?;
         }
-        Subcommand::ShowOrphaned(args) => {
+        Subcommand::Unowned(args) => {
             let torrent_files: HashSet<_> = read_torrents(args.torrent_files)?
                 .into_iter()
                 .flat_map(|x| x.1.files)
@@ -380,7 +380,7 @@ fn main() -> Result<(), Error> {
                 }
             }
         }
-        Subcommand::ShowMissing(args) => {
+        Subcommand::Missing(args) => {
             let existing: HashSet<Utf8PathBuf> =
                 read_dir_recursive(&args.data_dir)?.into_iter().collect();
             for (path, torrent) in read_torrents(args.torrent_files)? {
@@ -403,7 +403,7 @@ fn main() -> Result<(), Error> {
                 println!("{:#?}", torrent);
             }
         }
-        Subcommand::GetInfoHash(args) => {
+        Subcommand::InfoHash(args) => {
             for (path, torrent) in read_torrents(args.torrent_files)? {
                 println!("{}  {}", torrent.info_hash, path)
             }
