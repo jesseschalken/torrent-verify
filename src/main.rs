@@ -6,13 +6,15 @@ use camino::{Utf8Path, Utf8PathBuf};
 use clap::clap_derive::Subcommand;
 use clap::Parser;
 use itertools::Itertools;
+use memmap2::Mmap;
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use sha1::{Digest, Sha1};
 use std::collections::HashSet;
 use std::fmt::{Debug, Display, Formatter};
 use std::fs::File;
-use std::io::{ErrorKind, Read};
+use std::io::ErrorKind;
 use std::iter::once;
+use std::iter::repeat;
 use std::path::Path;
 use std::{fs, io};
 use unicode_normalization::UnicodeNormalization;
@@ -63,12 +65,6 @@ struct Torrent {
 
 #[derive(Eq, PartialEq, Hash)]
 struct Sha1Hash([u8; 20]);
-
-impl Sha1Hash {
-    fn hash(value: &[u8]) -> Self {
-        Self(Sha1::digest(value).into())
-    }
-}
 
 impl Debug for Sha1Hash {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -215,81 +211,63 @@ fn read_torrents(torrents: Vec<Utf8PathBuf>) -> Result<Vec<(Utf8PathBuf, Torrent
         .collect()
 }
 
-struct Zeros;
+/// SHA-1 processes in 64-byte blocks
+const ZEROS: &[u8] = &[0u8; 64];
 
-impl Read for Zeros {
-    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        output.fill(0);
-        Ok(output.len())
-    }
-}
+fn read_torrent_files(torrent: &Torrent, data_dir: &Path) -> io::Result<Vec<Sha1Hash>> {
+    let mmaps = torrent
+        .files
+        .iter()
+        .map(|(path, size)| {
+            let mmap = match File::open(data_dir.join(path)) {
+                Err(e) if e.kind() == ErrorKind::NotFound => None,
+                Err(e) => return Err(e),
+                Ok(file) => Some(unsafe { Mmap::map(&file) }?),
+            };
+            Ok((mmap, *size))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
 
-fn open_if_exists(path: &Path) -> io::Result<Option<File>> {
-    match File::open(path) {
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-        x => Ok(Some(x?)),
-    }
-}
+    let results = mmaps
+        .iter()
+        .flat_map(|(mmap, size)| {
+            let bytes = mmap.as_deref().into_iter();
+            let zeros = repeat(ZEROS);
+            bytes.chain(zeros).scan(*size, |need, slice| match need {
+                0 => None,
+                _ => {
+                    let slice = &slice[..slice.len().min(*need)];
+                    *need -= slice.len();
+                    Some(slice)
+                }
+            })
+        })
+        .peekable()
+        .batching(|slices| {
+            let mut hash = Sha1::default();
+            let mut need = torrent.piece_size;
 
-struct MaybeRead<T>(Option<T>);
-
-impl<T: Read> Read for MaybeRead<T> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.as_mut().map_or(Ok(0), |x| x.read(buf))
-    }
-}
-
-struct ConcatReader<R, I>(Option<R>, I);
-
-impl<R: Read, I: Iterator<Item = io::Result<R>>> ConcatReader<R, I> {
-    fn new(tail: I) -> Self {
-        Self(None, tail)
-    }
-}
-
-impl<R: Read, I: Iterator<Item = io::Result<R>>> Read for ConcatReader<R, I> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let ConcatReader(head, tail) = self;
-        loop {
-            if head.is_none() {
-                *head = tail.next().transpose()?
+            // Take any slices that are <= the bytes we need
+            while let Some(slice) = slices.next_if(|s| s.len() <= need) {
+                need -= slice.len();
+                hash.update(slice);
             }
-            match head {
-                None => break Ok(0),
-                Some(read) => match read.read(buf)? {
-                    0 if !buf.is_empty() => *head = None,
-                    n => break Ok(n),
-                },
+
+            // If there is a slice remaining, take as much as possible and leave behind the unused bytes
+            if let Some(slice) = slices.peek_mut() {
+                let (head, unused) = slice.split_at(need);
+                *slice = unused;
+                need -= head.len();
+                hash.update(head);
             }
-        }
-    }
-}
 
-fn read_torrent_files(torrent: &Torrent, data_dir: &Utf8Path) -> io::Result<Vec<Sha1Hash>> {
-    let mut results = Vec::with_capacity(torrent.pieces.len());
-    let mut buffer = vec![0; torrent.piece_size].into_boxed_slice();
-
-    let mut reader = ConcatReader::new(torrent.files.iter().map(|(path, file_size)| {
-        let file = open_if_exists(data_dir.join(path).as_ref())?;
-        Ok(MaybeRead(file).chain(Zeros).take(*file_size as u64))
-    }));
-
-    let mut buf_pos = 0;
-    loop {
-        let n = reader.read(&mut buffer[buf_pos..])?;
-        if n == 0 {
-            break;
-        }
-        buf_pos += n;
-        if buf_pos == buffer.len() {
-            results.push(Sha1Hash::hash(&buffer));
-            buf_pos = 0;
-        }
-    }
-
-    if buf_pos != 0 {
-        results.push(Sha1Hash::hash(&buffer[..buf_pos]))
-    }
+            if need == torrent.piece_size {
+                None
+            } else {
+                Some(Sha1Hash(hash.finalize().into()))
+            }
+        })
+        .collect_vec();
 
     assert_eq!(torrent.pieces.len(), results.len());
 
@@ -312,7 +290,7 @@ fn check_file_contents(
             let matches = if !any_files_exist {
                 torrent.pieces.iter().map(|_| false).collect()
             } else {
-                read_torrent_files(torrent, data_dir)?
+                read_torrent_files(torrent, data_dir.as_std_path())?
                     .iter()
                     .zip_eq(torrent.pieces.iter())
                     .map(|(a, b)| a == b)
