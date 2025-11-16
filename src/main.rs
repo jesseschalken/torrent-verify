@@ -2,7 +2,6 @@ mod bencode;
 
 use crate::bencode::Bencode;
 use base16ct::lower::encode_str;
-use camino::{Utf8Path, Utf8PathBuf};
 use clap::clap_derive::Subcommand;
 use clap::Parser;
 use itertools::Itertools;
@@ -10,12 +9,13 @@ use memmap2::Mmap;
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use sha1::{Digest, Sha1};
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fmt::{Debug, Display, Formatter};
 use std::fs::File;
 use std::io::ErrorKind;
 use std::iter::once;
 use std::iter::repeat;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::{fs, io};
 use unicode_normalization::UnicodeNormalization;
 
@@ -30,14 +30,14 @@ struct Cli {
 
 #[derive(Parser, Debug)]
 struct TorrentsAndData {
-    torrent_files: Vec<Utf8PathBuf>,
+    torrent_files: Vec<PathBuf>,
     #[arg(short, long = "data")]
-    data_dir: Utf8PathBuf,
+    data_dir: PathBuf,
 }
 
 #[derive(Parser, Debug)]
 struct JustTorrents {
-    torrent_files: Vec<Utf8PathBuf>,
+    torrent_files: Vec<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -58,7 +58,7 @@ enum Subcommand {
 struct Torrent {
     info_hash: Sha1Hash,
     _announce: Vec<String>,
-    files: Vec<(Utf8PathBuf, usize)>,
+    files: Vec<(String, usize)>,
     pieces: Vec<Sha1Hash>,
     piece_size: usize,
 }
@@ -116,7 +116,12 @@ impl TryFrom<Bencode> for Torrent {
             },
             files: files
                 .into_iter()
-                .map(|(path, length)| (once(&name).chain(&path).collect(), length))
+                .map(|(path, length)| {
+                    let path = once(&*name)
+                        .chain(path.iter().flat_map(|s| ["/", s]))
+                        .collect();
+                    (path, length)
+                })
                 .collect(),
             pieces: info
                 .remove_key("pieces")?
@@ -134,21 +139,19 @@ impl Torrent {
     fn fix_windows_paths(&mut self) {
         for (path, _) in &mut self.files {
             *path = path
-                .as_str()
                 .chars()
                 .map(|c| match c {
                     '<' | '>' | ':' | '"' | '|' | '?' | '*' => '_',
                     '\x00'..='\x1F' => '_',
                     c => c,
                 })
-                .collect::<String>()
-                .into();
+                .collect();
         }
     }
 
     fn normalize_utf8_paths(&mut self) {
         for (path, _) in &mut self.files {
-            *path = normalize_utf8(path.as_str()).into();
+            *path = normalize_utf8(path).into();
         }
     }
 }
@@ -163,14 +166,14 @@ fn normalize_utf8(s: &str) -> String {
     }
 }
 
-fn read_dir_recursive(dir: &Utf8Path) -> io::Result<Vec<Utf8PathBuf>> {
-    fn read_into(dir: &Utf8Path, out: &mut Vec<Utf8PathBuf>) -> io::Result<()> {
-        for ent in dir.read_dir_utf8()? {
+fn read_dir_recursive(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    fn read_into(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
+        for ent in dir.read_dir()? {
             let ent = ent?;
             if ent.file_type()?.is_dir() {
                 read_into(&ent.path(), out)?;
             } else {
-                out.push(ent.into_path());
+                out.push(ent.path());
             }
         }
         Ok(())
@@ -180,14 +183,14 @@ fn read_dir_recursive(dir: &Utf8Path) -> io::Result<Vec<Utf8PathBuf>> {
     Ok(ret)
 }
 
-fn find_torrents(dir: &Utf8Path) -> io::Result<Vec<Utf8PathBuf>> {
+fn find_torrents(dir: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(read_dir_recursive(dir)?
         .into_iter()
-        .filter(|path| path.extension() == Some("torrent"))
+        .filter(|path| path.extension() == Some(OsStr::new("torrent")))
         .collect())
 }
 
-fn read_torrents(torrents: Vec<Utf8PathBuf>) -> Result<Vec<(Utf8PathBuf, Torrent)>, Error> {
+fn read_torrents(torrents: Vec<PathBuf>) -> Result<Vec<(PathBuf, Torrent)>, Error> {
     torrents
         .into_iter()
         .map(|path| {
@@ -274,10 +277,7 @@ fn read_torrent_files(torrent: &Torrent, data_dir: &Path) -> io::Result<Vec<Sha1
     Ok(results)
 }
 
-fn check_file_contents(
-    torrents: &[(Utf8PathBuf, Torrent)],
-    data_dir: &Utf8Path,
-) -> Result<(), Error> {
+fn check_file_contents(torrents: &[(PathBuf, Torrent)], data_dir: &Path) -> Result<(), Error> {
     torrents
         .into_par_iter()
         .with_max_len(1)
@@ -290,7 +290,7 @@ fn check_file_contents(
             let matches = if !any_files_exist {
                 torrent.pieces.iter().map(|_| false).collect()
             } else {
-                read_torrent_files(torrent, data_dir.as_std_path())?
+                read_torrent_files(torrent, data_dir)?
                     .iter()
                     .zip_eq(torrent.pieces.iter())
                     .map(|(a, b)| a == b)
@@ -305,7 +305,7 @@ fn check_file_contents(
                 .map(char_for)
                 .collect::<String>();
 
-            println!("{: >8.2}%  {}  {}", percent, progress, name);
+            println!("{: >8.2}%  {}  {}", percent, progress, name.display());
 
             Ok(())
         })
@@ -354,12 +354,12 @@ fn main() -> Result<(), Error> {
                 .collect();
             for file in read_dir_recursive(&args.data_dir)? {
                 if !torrent_files.contains(&file) {
-                    println!("{}", file);
+                    println!("{}", file.display());
                 }
             }
         }
         Subcommand::Missing(args) => {
-            let existing: HashSet<Utf8PathBuf> =
+            let existing: HashSet<PathBuf> =
                 read_dir_recursive(&args.data_dir)?.into_iter().collect();
             for (path, torrent) in read_torrents(args.torrent_files)? {
                 let missing = torrent
@@ -369,9 +369,9 @@ fn main() -> Result<(), Error> {
                     .filter(|x| !existing.contains(x))
                     .collect_vec();
                 if missing.len() > 0 {
-                    println!("{}", path);
+                    println!("{}", path.display());
                     for file in missing {
-                        println!("  {}", file);
+                        println!("  {}", file.display());
                     }
                 }
             }
@@ -383,7 +383,7 @@ fn main() -> Result<(), Error> {
         }
         Subcommand::InfoHash(args) => {
             for (path, torrent) in read_torrents(args.torrent_files)? {
-                println!("{}  {}", torrent.info_hash, path)
+                println!("{}  {}", torrent.info_hash, path.display())
             }
         }
     }
