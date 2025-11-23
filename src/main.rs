@@ -312,7 +312,7 @@ fn check_file_contents(torrents: &[(PathBuf, Torrent)], data_dir: &Path) -> Resu
         .collect()
 }
 
-const CHARS: [char; 3] = ['○', '◒', '●'];
+const CHARS: [char; 3] = [' ', '·', '•'];
 
 fn char_for(bools: &[bool]) -> char {
     let [empty, partial, complete] = CHARS;
