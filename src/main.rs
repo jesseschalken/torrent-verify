@@ -330,7 +330,7 @@ fn check_file_contents(torrents: &[(PathBuf, Torrent)], data_dir: &Path) -> Resu
             let num_matches = matches.iter().filter(|x| **x).count();
             let percent = (num_matches as f64) * 100f64 / torrent.pieces.len() as f64;
 
-            let progress = compress(&matches, 20)
+            let progress = compress(&matches, 40)
                 .into_iter()
                 .map(char_for)
                 .collect::<String>();
