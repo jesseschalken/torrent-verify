@@ -288,10 +288,10 @@ fn read_torrent_files(torrent: &Torrent, data_dir: &Path) -> io::Result<Vec<Sha1
             if need > 0
                 && let Some(slice) = slices.peek_mut()
             {
-                let (head, unused) = slice.split_at(need);
-                *slice = unused;
-                need -= head.len();
-                hash.update(head);
+                let bytes;
+                (bytes, *slice) = slice.split_at(need);
+                need -= bytes.len();
+                hash.update(bytes);
             }
 
             if need == torrent.piece_size {
