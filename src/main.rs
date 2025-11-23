@@ -2,8 +2,8 @@ mod bencode;
 
 use crate::bencode::Bencode;
 use base16ct::lower::encode_str;
-use clap::clap_derive::Subcommand;
 use clap::Parser;
+use clap::clap_derive::Subcommand;
 use itertools::Itertools;
 use memmap2::Mmap;
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
@@ -11,7 +11,7 @@ use sha1::{Digest, Sha1};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt::{Debug, Display, Formatter};
-use std::fs::File;
+use std::fs::{File, ReadDir};
 use std::io::ErrorKind;
 use std::iter::once;
 use std::iter::repeat;
@@ -151,7 +151,7 @@ impl Torrent {
 
     fn normalize_utf8_paths(&mut self) {
         for (path, _) in &mut self.files {
-            *path = normalize_utf8(path).into();
+            *path = normalize_utf8(path);
         }
     }
 }
@@ -166,28 +166,55 @@ fn normalize_utf8(s: &str) -> String {
     }
 }
 
-fn read_dir_recursive(dir: &Path) -> io::Result<Vec<PathBuf>> {
-    fn read_into(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
-        for ent in dir.read_dir()? {
-            let ent = ent?;
-            if ent.file_type()?.is_dir() {
-                read_into(&ent.path(), out)?;
-            } else {
-                out.push(ent.path());
+struct ReadDirRecursive {
+    // LIFO queue of directories to read
+    queue: Vec<PathBuf>,
+    current: ReadDir,
+}
+
+impl ReadDirRecursive {
+    fn next_or_error(&mut self) -> io::Result<Option<PathBuf>> {
+        loop {
+            match self.current.next() {
+                Some(Ok(ref entry)) => {
+                    if entry.file_type()?.is_dir() {
+                        self.queue.push(entry.path());
+                    } else {
+                        return Ok(Some(entry.path()));
+                    }
+                }
+                Some(Err(e)) => return Err(e),
+                None => match self.queue.pop() {
+                    Some(next) => self.current = next.read_dir()?,
+                    None => return Ok(None),
+                },
             }
         }
-        Ok(())
     }
-    let mut ret = Vec::new();
-    read_into(dir, &mut ret)?;
-    Ok(ret)
+}
+
+impl Iterator for ReadDirRecursive {
+    type Item = io::Result<PathBuf>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_or_error().transpose()
+    }
+}
+
+fn read_dir_recursive(dir: &Path) -> io::Result<ReadDirRecursive> {
+    Ok(ReadDirRecursive {
+        queue: Vec::new(),
+        current: dir.read_dir()?,
+    })
 }
 
 fn find_torrents(dir: &Path) -> io::Result<Vec<PathBuf>> {
-    Ok(read_dir_recursive(dir)?
+    read_dir_recursive(dir)?
         .into_iter()
-        .filter(|path| path.extension() == Some(OsStr::new("torrent")))
-        .collect())
+        .filter(|path| match path {
+            Ok(path) if path.extension() == Some(OsStr::new("torrent")) => true,
+            _ => false,
+        })
+        .collect()
 }
 
 fn read_torrents(torrents: Vec<PathBuf>) -> Result<Vec<(PathBuf, Torrent)>, Error> {
@@ -214,9 +241,6 @@ fn read_torrents(torrents: Vec<PathBuf>) -> Result<Vec<(PathBuf, Torrent)>, Erro
         .collect()
 }
 
-/// SHA-1 processes in 64-byte blocks
-const ZEROS: &[u8] = &[0u8; 64];
-
 fn read_torrent_files(torrent: &Torrent, data_dir: &Path) -> io::Result<Vec<Sha1Hash>> {
     let mmaps = torrent
         .files
@@ -225,7 +249,7 @@ fn read_torrent_files(torrent: &Torrent, data_dir: &Path) -> io::Result<Vec<Sha1
             let mmap = match File::open(data_dir.join(path)) {
                 Err(e) if e.kind() == ErrorKind::NotFound => None,
                 Err(e) => return Err(e),
-                Ok(file) => Some(unsafe { Mmap::map(&file) }?),
+                Ok(ref file) => Some(unsafe { Mmap::map(file) }?),
             };
             Ok((mmap, *size))
         })
@@ -234,16 +258,20 @@ fn read_torrent_files(torrent: &Torrent, data_dir: &Path) -> io::Result<Vec<Sha1
     let results = mmaps
         .iter()
         .flat_map(|(mmap, size)| {
-            let bytes = mmap.as_deref().into_iter();
-            let zeros = repeat(ZEROS);
-            bytes.chain(zeros).scan(*size, |need, slice| match need {
-                0 => None,
-                _ => {
-                    let slice = &slice[..slice.len().min(*need)];
-                    *need -= slice.len();
-                    Some(slice)
-                }
-            })
+            mmap.as_deref()
+                .into_iter()
+                // SHA-1 processes in 64-byte blocks
+                .chain(repeat(&[0u8; 64][..]))
+                .scan(*size, |need, mut slice| match need {
+                    0 => None,
+                    _ => {
+                        if slice.len() > *need {
+                            slice = &slice[..*need];
+                        }
+                        *need -= slice.len();
+                        Some(slice)
+                    }
+                })
         })
         .peekable()
         .batching(|slices| {
@@ -257,7 +285,9 @@ fn read_torrent_files(torrent: &Torrent, data_dir: &Path) -> io::Result<Vec<Sha1
             }
 
             // If there is a slice remaining, take as much as possible and leave behind the unused bytes
-            if let Some(slice) = slices.peek_mut() {
+            if need > 0
+                && let Some(slice) = slices.peek_mut()
+            {
                 let (head, unused) = slice.split_at(need);
                 *slice = unused;
                 need -= head.len();
@@ -353,14 +383,16 @@ fn main() -> Result<(), Error> {
                 .map(|x| args.data_dir.join(x.0))
                 .collect();
             for file in read_dir_recursive(&args.data_dir)? {
+                let file = file?;
                 if !torrent_files.contains(&file) {
                     println!("{}", file.display());
                 }
             }
         }
         Subcommand::Missing(args) => {
-            let existing: HashSet<PathBuf> =
-                read_dir_recursive(&args.data_dir)?.into_iter().collect();
+            let existing: HashSet<PathBuf> = read_dir_recursive(&args.data_dir)?
+                .into_iter()
+                .collect::<io::Result<_>>()?;
             for (path, torrent) in read_torrents(args.torrent_files)? {
                 let missing = torrent
                     .files
