@@ -166,30 +166,23 @@ fn normalize_utf8(s: &str) -> String {
     }
 }
 
-struct ReadDirRecursive {
-    // LIFO queue of directories to read
-    queue: Vec<PathBuf>,
-    current: ReadDir,
-}
+struct ReadDirRecursive(Vec<ReadDir>);
 
 impl ReadDirRecursive {
     fn next_or_error(&mut self) -> io::Result<Option<PathBuf>> {
-        loop {
-            match self.current.next() {
-                Some(Ok(ref entry)) => {
-                    if entry.file_type()?.is_dir() {
-                        self.queue.push(entry.path());
-                    } else {
-                        return Ok(Some(entry.path()));
-                    }
+        while let Some(iter) = self.0.last_mut() {
+            if let Some(entry) = iter.next() {
+                let ref entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    self.0.push(entry.path().read_dir()?);
+                } else {
+                    return Ok(Some(entry.path()));
                 }
-                Some(Err(e)) => return Err(e),
-                None => match self.queue.pop() {
-                    Some(next) => self.current = next.read_dir()?,
-                    None => return Ok(None),
-                },
+            } else {
+                self.0.pop();
             }
         }
+        Ok(None)
     }
 }
 
@@ -201,10 +194,7 @@ impl Iterator for ReadDirRecursive {
 }
 
 fn read_dir_recursive(dir: &Path) -> io::Result<ReadDirRecursive> {
-    Ok(ReadDirRecursive {
-        queue: Vec::new(),
-        current: dir.read_dir()?,
-    })
+    Ok(ReadDirRecursive(vec![dir.read_dir()?]))
 }
 
 fn find_torrents(dir: &Path) -> io::Result<Vec<PathBuf>> {
