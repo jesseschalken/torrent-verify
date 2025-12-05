@@ -216,85 +216,72 @@ fn decode_string(bytes: &[u8]) -> Result<(&[u8], &[u8]), BoxedError> {
 mod tests {
     use super::*;
 
+    fn check_encode_decode(bytes: &[u8], value: Bencode, trailing: &[u8]) {
+        assert_eq!(Bencode::decode(bytes).unwrap(), (value.clone(), trailing));
+        let mut encoded = value.encode_to_vec();
+        encoded.extend_from_slice(trailing);
+        assert_eq!(encoded, bytes);
+    }
+
     #[test]
     fn test_decode_int() {
-        let bytes = b"i42e";
-        let value = Bencode::Int(42);
-        assert_eq!(
-            Bencode::decode(bytes).unwrap(),
-            (value.clone(), b"" as &[u8])
-        );
-        assert_eq!(value.encode_to_vec(), bytes);
-
-        let bytes = b"i-5eTAIL";
-        let value = Bencode::Int(-5);
-        assert_eq!(
-            Bencode::decode(bytes).unwrap(),
-            (value.clone(), b"TAIL" as &[u8])
-        );
+        check_encode_decode(b"i42e", Bencode::Int(42), b"");
+        check_encode_decode(b"i-5eTAIL", Bencode::Int(-5), b"TAIL");
 
         assert!(Bencode::decode(b"i42").is_err()); // missing 'e'
     }
 
     #[test]
     fn test_decode_bytes_and_remainder() {
-        let bytes = b"4:spamXYZ";
-        let value = Bencode::Bytes(b"spam".to_vec());
-
-        assert_eq!(
-            Bencode::decode(bytes).unwrap(),
-            (value.clone(), b"XYZ" as &[u8])
-        );
+        check_encode_decode(b"4:spam", Bencode::Bytes(b"spam".to_vec()), b"");
+        check_encode_decode(b"4:spamXYZ", Bencode::Bytes(b"spam".to_vec()), b"XYZ");
 
         assert!(Bencode::decode(b"4spam").is_err()); // missing ':'
     }
 
     #[test]
     fn test_decode_list() {
-        let bytes = b"l4:spam4:eggse";
-        let value = Bencode::List(vec![
-            Bencode::Bytes(b"spam".to_vec()),
-            Bencode::Bytes(b"eggs".to_vec()),
-        ]);
-
-        assert_eq!(
-            Bencode::decode(bytes).unwrap(),
-            (value.clone(), b"" as &[u8])
+        check_encode_decode(
+            b"l4:spam4:eggse",
+            Bencode::List(vec![
+                Bencode::Bytes(b"spam".to_vec()),
+                Bencode::Bytes(b"eggs".to_vec()),
+            ]),
+            b"",
         );
-        assert_eq!(value.encode_to_vec(), bytes);
     }
 
     #[test]
     fn test_decode_dict() {
-        let bytes = b"d3:cow3:moo4:spam4:eggse";
-        let value = Bencode::Dict(BTreeMap::from_iter([
-            (b"cow".to_vec(), Bencode::Bytes(b"moo".to_vec())),
-            (b"spam".to_vec(), Bencode::Bytes(b"eggs".to_vec())),
-        ]));
-
-        assert_eq!(
-            Bencode::decode(bytes).unwrap(),
-            (value.clone(), b"" as &[u8])
+        check_encode_decode(
+            b"d3:cow3:moo4:spam4:eggse",
+            Bencode::Dict(BTreeMap::from_iter([
+                (b"cow".to_vec(), Bencode::Bytes(b"moo".to_vec())),
+                (b"spam".to_vec(), Bencode::Bytes(b"eggs".to_vec())),
+            ])),
+            b"",
         );
-        assert_eq!(value.encode_to_vec(), bytes);
     }
 
     #[test]
     fn test_decode_nested() {
-        let bytes = b"li123ed3:onei1e3:twoi2eee";
-        let value = Bencode::List(vec![
-            Bencode::Int(123),
+        check_encode_decode(
+            b"d4:dictd3:foo3:bare4:listli1ei2ei3eee",
             Bencode::Dict(BTreeMap::from_iter([
-                (b"one".to_vec(), Bencode::Int(1)),
-                (b"two".to_vec(), Bencode::Int(2)),
+                (
+                    b"dict".to_vec(),
+                    Bencode::Dict(BTreeMap::from_iter([(
+                        b"foo".to_vec(),
+                        Bencode::Bytes(b"bar".to_vec()),
+                    )])),
+                ),
+                (
+                    b"list".to_vec(),
+                    Bencode::List(vec![Bencode::Int(1), Bencode::Int(2), Bencode::Int(3)]),
+                ),
             ])),
-        ]);
-
-        assert_eq!(
-            Bencode::decode(bytes).unwrap(),
-            (value.clone(), b"" as &[u8])
+            b"",
         );
-        assert_eq!(value.encode_to_vec(), bytes);
     }
 
     #[test]
