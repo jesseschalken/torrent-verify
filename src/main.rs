@@ -251,7 +251,7 @@ fn read_torrent_files(torrent: &Torrent, data_dir: &Path) -> io::Result<Vec<Sha1
             mmap.as_deref()
                 .into_iter()
                 // SHA-1 processes in 64-byte blocks
-                .chain(repeat(&[0u8; 64][..]))
+                .chain(repeat(&[0; 64][..]))
                 .scan(*size, |need, mut slice| match need {
                     0 => None,
                     _ => {
@@ -266,28 +266,28 @@ fn read_torrent_files(torrent: &Torrent, data_dir: &Path) -> io::Result<Vec<Sha1
         .peekable()
         .batching(|slices| {
             let mut hash = Sha1::default();
-            let mut need = torrent.piece_size;
+            let max = torrent.piece_size;
+            let mut done = 0;
 
             // Take any slices that are <= the bytes we need
-            while let Some(slice) = slices.next_if(|s| s.len() <= need) {
-                need -= slice.len();
+            while let Some(slice) = slices.next_if(|s| s.len() <= (max - done)) {
+                done += slice.len();
                 hash.update(slice);
             }
 
             // If there is a slice remaining, take as much as possible and leave behind the unused bytes
-            if need > 0
+            if done < max
                 && let Some(slice) = slices.peek_mut()
             {
                 let bytes;
-                (bytes, *slice) = slice.split_at(need);
-                need -= bytes.len();
+                (bytes, *slice) = slice.split_at(max - done);
+                done += bytes.len();
                 hash.update(bytes);
             }
 
-            if need == torrent.piece_size {
-                None
-            } else {
-                Some(Sha1Hash(hash.finalize().into()))
+            match done {
+                0 => None,
+                _ => Some(Sha1Hash(hash.finalize().into())),
             }
         })
         .collect_vec();
@@ -320,10 +320,7 @@ fn check_file_contents(torrents: &[(PathBuf, Torrent)], data_dir: &Path) -> Resu
             let num_matches = matches.iter().filter(|x| **x).count();
             let percent = (num_matches as f64) * 100f64 / torrent.pieces.len() as f64;
 
-            let progress = compress(&matches, 40)
-                .into_iter()
-                .map(char_for)
-                .collect::<String>();
+            let progress: String = compress(&matches, 40).map(char_for).collect();
 
             println!("{: >8.2}%  {}  {}", percent, progress, name.display());
 
@@ -343,19 +340,17 @@ fn char_for(bools: &[bool]) -> char {
     }
 }
 
-fn compress(bools: &[bool], size: usize) -> Vec<&[bool]> {
-    (0..size)
-        .map(|i| {
-            let [i, j] = [i, i + 1].map(|i| (i * bools.len()) / size);
-            if i == j && j < bools.len() {
-                &bools[i..j + 1]
-            } else if i == j && i > 0 {
-                &bools[i - 1..j]
-            } else {
-                &bools[i..j]
-            }
-        })
-        .collect()
+fn compress(bools: &[bool], size: usize) -> impl Iterator<Item = &[bool]> {
+    (0..size).map(move |i| {
+        let [i, j] = [i, i + 1].map(|i| i * bools.len() / size);
+        if i == j && j < bools.len() {
+            &bools[i..j + 1]
+        } else if i == j && i > 0 {
+            &bools[i - 1..j]
+        } else {
+            &bools[i..j]
+        }
+    })
 }
 
 fn main() -> Result<(), Error> {
