@@ -18,8 +18,3 @@ base16ct = "0.2.0"
 itoa = "1.0.15"
 atoi = "2.0.0"
 memmap2 = "0.9.9"
-
-[profile.release]
-lto = true
-codegen-units = 1
-panic = "abort"

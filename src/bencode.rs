@@ -2,7 +2,6 @@ use atoi::FromRadix10;
 use atoi::FromRadix10Signed;
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::fmt::Display;
 use std::io;
 use std::io::Write;
 
@@ -17,10 +16,10 @@ pub enum Bencode {
 type BoxedError = Box<dyn Error + Send + Sync>;
 
 impl Bencode {
-    pub fn remove_key(&mut self, key: impl AsRef<[u8]> + Display) -> Result<Bencode, String> {
+    pub fn remove_key(&mut self, key: &str) -> Result<Bencode, String> {
         match self {
             Bencode::Dict(dict) => dict
-                .remove(key.as_ref())
+                .remove(key.as_bytes())
                 .ok_or_else(|| format!("Key '{key}' not found")),
             _ => Err(format!("Expected a dict, got {}", self.get_type())),
         }

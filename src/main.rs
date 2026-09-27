@@ -8,6 +8,7 @@ use itertools::Itertools;
 use memmap2::Mmap;
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use sha1::{Digest, Sha1};
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt::{Debug, Display, Formatter};
@@ -52,6 +53,8 @@ enum Subcommand {
     Dump(JustTorrents),
     #[command(about = "Get the info-hash of each provided torrent file")]
     InfoHash(JustTorrents),
+    #[command(about = "List the files owned by the provided torrent files")]
+    Files(JustTorrents),
 }
 
 #[derive(Debug)]
@@ -79,9 +82,7 @@ impl Display for Sha1Hash {
 }
 
 fn get_info_hash(info: &Bencode) -> Sha1Hash {
-    let mut data = Vec::new();
-    info.encode(&mut data).unwrap();
-    return Sha1Hash(Sha1::digest(&data).into());
+    Sha1Hash(Sha1::digest(&info.encode_to_vec()).into())
 }
 
 impl TryFrom<Bencode> for Torrent {
@@ -201,8 +202,8 @@ fn find_torrents(dir: &Path) -> io::Result<Vec<PathBuf>> {
     read_dir_recursive(dir)?
         .into_iter()
         .filter(|path| match path {
-            Ok(path) if path.extension() == Some(OsStr::new("torrent")) => true,
-            _ => false,
+            Ok(path) => path.extension() == Some(OsStr::new("torrent")),
+            _ => true,
         })
         .collect()
 }
@@ -231,16 +232,23 @@ fn read_torrents(torrents: Vec<PathBuf>) -> Result<Vec<(PathBuf, Torrent)>, Erro
         .collect()
 }
 
+fn with_partial_files(path: Cow<str>) -> impl Iterator<Item = Cow<str>> {
+    [path.clone(), path.clone() + ".part", path + ".!qB"].into_iter()
+}
+
 fn read_torrent_files(torrent: &Torrent, data_dir: &Path) -> io::Result<Vec<Sha1Hash>> {
     let mmaps = torrent
         .files
         .iter()
         .map(|(path, size)| {
-            let mmap = match File::open(data_dir.join(path)) {
-                Err(e) if e.kind() == ErrorKind::NotFound => None,
-                Err(e) => return Err(e),
-                Ok(ref file) => Some(unsafe { Mmap::map(file) }?),
-            };
+            let mmap = with_partial_files(path.into())
+                .flat_map(|path| match File::open(data_dir.join(&*path)) {
+                    Err(e) if e.kind() == ErrorKind::NotFound => None,
+                    x => Some(x),
+                })
+                .map(|file| unsafe { Mmap::map(&file?) })
+                .next()
+                .transpose()?;
             Ok((mmap, *size))
         })
         .collect::<io::Result<Vec<_>>>()?;
@@ -250,8 +258,9 @@ fn read_torrent_files(torrent: &Torrent, data_dir: &Path) -> io::Result<Vec<Sha1
         .flat_map(|(mmap, size)| {
             mmap.as_deref()
                 .into_iter()
-                // SHA-1 processes in 64-byte blocks
+                // Add infinite slices of zeros (SHA1 processes in 64 byte blocks)
                 .chain(repeat(&[0; 64][..]))
+                // Take only up to the size we need for this file
                 .scan(*size, |need, mut slice| match need {
                     0 => None,
                     _ => {
@@ -269,14 +278,15 @@ fn read_torrent_files(torrent: &Torrent, data_dir: &Path) -> io::Result<Vec<Sha1
             let max = torrent.piece_size;
             let mut done = 0;
 
-            // Take any slices that are <= the bytes we need
+            // Take any slices that are <= the bytes we need for this piece
             while let Some(slice) = slices.next_if(|s| s.len() <= (max - done)) {
                 done += slice.len();
                 hash.update(slice);
             }
 
-            // If there is a slice remaining, take as much as possible and leave behind the unused bytes
-            if done < max
+            // If there is a slice remaining bigger than we need, take as much as
+            // possible and leave behind the unused bytes
+            if done != max
                 && let Some(slice) = slices.peek_mut()
             {
                 let bytes;
@@ -305,7 +315,8 @@ fn check_file_contents(torrents: &[(PathBuf, Torrent)], data_dir: &Path) -> Resu
             let any_files_exist = torrent
                 .files
                 .iter()
-                .any(|(path, _)| data_dir.join(path).exists());
+                .flat_map(|(path, _size)| with_partial_files(path.into()))
+                .any(|path| data_dir.join(&*path).exists());
 
             let matches = if !any_files_exist {
                 torrent.pieces.iter().map(|_| false).collect()
@@ -319,6 +330,7 @@ fn check_file_contents(torrents: &[(PathBuf, Torrent)], data_dir: &Path) -> Resu
 
             let num_matches = matches.iter().filter(|x| **x).count();
             let percent = (num_matches as f64) * 100f64 / torrent.pieces.len() as f64;
+            let percent = (percent * 100f64).round() / 100f64; // Round down to 2 decimal places
 
             let progress: String = compress(&matches, 40).map(char_for).collect();
 
@@ -364,11 +376,16 @@ fn main() -> Result<(), Error> {
         Subcommand::Unowned(args) => {
             let torrent_files: HashSet<_> = read_torrents(args.torrent_files)?
                 .into_iter()
-                .flat_map(|x| x.1.files)
-                .map(|x| args.data_dir.join(x.0))
+                .flat_map(|(_path, torrent)| torrent.files)
+                .flat_map(|(path, _size)| with_partial_files(path.into()))
+                .map(|path| args.data_dir.join(&*path))
                 .collect();
+
             for file in read_dir_recursive(&args.data_dir)? {
                 let file = file?;
+                if file.file_name() == Some(OsStr::new(".DS_Store")) {
+                    continue;
+                }
                 if !torrent_files.contains(&file) {
                     println!("{}", file.display());
                 }
@@ -378,13 +395,19 @@ fn main() -> Result<(), Error> {
             let existing: HashSet<PathBuf> = read_dir_recursive(&args.data_dir)?
                 .into_iter()
                 .collect::<io::Result<_>>()?;
+
             for (path, torrent) in read_torrents(args.torrent_files)? {
                 let missing = torrent
                     .files
-                    .into_iter()
-                    .map(|x| args.data_dir.join(x.0))
-                    .filter(|x| !existing.contains(x))
+                    .iter()
+                    .map(|(path, _size)| path)
+                    .filter(|&path| {
+                        !with_partial_files(path.into())
+                            .any(|path| existing.contains(&args.data_dir.join(&*path)))
+                    })
+                    .map(|path| args.data_dir.join(path))
                     .collect_vec();
+
                 if missing.len() > 0 {
                     println!("{}", path.display());
                     for file in missing {
@@ -396,6 +419,14 @@ fn main() -> Result<(), Error> {
         Subcommand::Dump(args) => {
             for (_, torrent) in read_torrents(args.torrent_files)? {
                 println!("{:#?}", torrent);
+            }
+        }
+        Subcommand::Files(args) => {
+            for (path, torrent) in read_torrents(args.torrent_files)? {
+                println!("{}", path.display());
+                for (file, _) in torrent.files {
+                    println!("  {}", file);
+                }
             }
         }
         Subcommand::InfoHash(args) => {
