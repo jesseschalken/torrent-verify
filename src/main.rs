@@ -344,7 +344,7 @@ fn check_file_contents(torrents: &[(PathBuf, Torrent)], data_dir: &Path) -> Resu
             let percent = (num_matches as f64) * 100f64 / torrent.pieces.len() as f64;
             let percent = (percent * 100f64).round() / 100f64; // Round down to 2 decimal places
 
-            let progress: String = compress(&matches, 40).map(char_for).collect();
+            let progress: String = compress(&matches, 20).map(char_for).collect();
 
             println!("{: >8.2}%  {}  {}", percent, progress, name.display());
 
@@ -353,14 +353,11 @@ fn check_file_contents(torrents: &[(PathBuf, Torrent)], data_dir: &Path) -> Resu
         .collect()
 }
 
-const CHARS: [char; 3] = ['○', '◒', '●'];
-
 fn char_for(bools: &[bool]) -> char {
-    let [empty, partial, complete] = CHARS;
-    match bools.iter().filter(|x| **x).count() {
-        x if x == bools.len() => complete,
-        0 => empty,
-        _ => partial,
+    if bools.iter().filter(|x| **x).count() > bools.len() / 2 {
+        '●'
+    } else {
+        '○'
     }
 }
 
