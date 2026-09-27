@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "A command-line tool to verify downloaded torrent data"
 license = "MIT"
+repository = "https://github.com/jesseschalken/torrent-verify"
 
 [[bin]]
 name = "torrent-verify"
