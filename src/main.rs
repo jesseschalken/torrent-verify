@@ -30,15 +30,24 @@ struct Cli {
 }
 
 #[derive(Parser, Debug)]
-struct TorrentsAndData {
+struct JustTorrents {
+    /// Path to a torrent file or a directory containing torrent files
     torrent_files: Vec<PathBuf>,
-    #[arg(short, long = "data")]
-    data_dir: PathBuf,
+    /// Replace characters that are invalid on Windows (e.g. <, >, :, ", |, ?, *) with underscores
+    #[arg(long, default_value_t = cfg!(windows), help_heading = Some("Path fixing"))]
+    fix_windows_paths: bool,
+    /// Normalize Unicode paths (NFC, or NFD on macOS/iOS)
+    #[arg(long, default_value_t = true, help_heading = Some("Path fixing"))]
+    normalize_utf8_paths: bool,
 }
 
 #[derive(Parser, Debug)]
-struct JustTorrents {
-    torrent_files: Vec<PathBuf>,
+struct TorrentsAndData {
+    #[command(flatten)]
+    torrents: JustTorrents,
+    /// Path to the directory containing the downloaded data
+    #[arg(short, long = "data")]
+    data_dir: PathBuf,
 }
 
 #[derive(Subcommand, Debug)]
@@ -207,14 +216,14 @@ fn find_torrents(dir: &Path) -> io::Result<Vec<PathBuf>> {
         .collect()
 }
 
-fn read_torrents(torrents: Vec<PathBuf>) -> Result<Vec<(PathBuf, Torrent)>, Error> {
-    torrents
-        .into_iter()
+fn read_torrents(opts: &JustTorrents) -> Result<Vec<(PathBuf, Torrent)>, Error> {
+    opts.torrent_files
+        .iter()
         .map(|path| {
             if path.is_dir() {
                 find_torrents(&path)
             } else {
-                Ok(vec![path])
+                Ok(vec![path.clone()])
             }
         })
         .collect::<Result<Vec<_>, _>>()?
@@ -224,8 +233,12 @@ fn read_torrents(torrents: Vec<PathBuf>) -> Result<Vec<(PathBuf, Torrent)>, Erro
             let bytes = fs::read(&path)?;
             let (value, _) = Bencode::decode(&bytes)?;
             let mut torrent: Torrent = value.try_into()?;
-            torrent.fix_windows_paths();
-            torrent.normalize_utf8_paths();
+            if opts.fix_windows_paths {
+                torrent.fix_windows_paths();
+            }
+            if opts.normalize_utf8_paths {
+                torrent.normalize_utf8_paths();
+            }
             Ok((path, torrent))
         })
         .collect()
@@ -369,11 +382,11 @@ fn main() -> Result<(), Error> {
 
     match cli.command {
         Subcommand::Verify(args) => {
-            let torrents = read_torrents(args.torrent_files)?;
+            let torrents = read_torrents(&args.torrents)?;
             check_file_contents(&torrents, &args.data_dir)?;
         }
         Subcommand::Unowned(args) => {
-            let torrent_files: HashSet<_> = read_torrents(args.torrent_files)?
+            let torrent_files: HashSet<_> = read_torrents(&args.torrents)?
                 .into_iter()
                 .flat_map(|(_path, torrent)| torrent.files)
                 .flat_map(|(path, _size)| with_partial_files(path.into()))
@@ -395,7 +408,7 @@ fn main() -> Result<(), Error> {
                 .into_iter()
                 .collect::<io::Result<_>>()?;
 
-            for (path, torrent) in read_torrents(args.torrent_files)? {
+            for (path, torrent) in read_torrents(&args.torrents)? {
                 let missing = torrent
                     .files
                     .iter()
@@ -416,12 +429,12 @@ fn main() -> Result<(), Error> {
             }
         }
         Subcommand::Dump(args) => {
-            for (_, torrent) in read_torrents(args.torrent_files)? {
+            for (_, torrent) in read_torrents(&args)? {
                 println!("{:#?}", torrent);
             }
         }
         Subcommand::Files(args) => {
-            for (path, torrent) in read_torrents(args.torrent_files)? {
+            for (path, torrent) in read_torrents(&args)? {
                 println!("{}", path.display());
                 for (file, _) in torrent.files {
                     println!("  {}", file);
@@ -429,7 +442,7 @@ fn main() -> Result<(), Error> {
             }
         }
         Subcommand::InfoHash(args) => {
-            for (path, torrent) in read_torrents(args.torrent_files)? {
+            for (path, torrent) in read_torrents(&args)? {
                 println!("{}  {}", torrent.info_hash, path.display())
             }
         }
