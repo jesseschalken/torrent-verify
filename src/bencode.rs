@@ -94,10 +94,10 @@ impl TryFrom<Bencode> for BTreeMap<Vec<u8>, Bencode> {
 
 impl Bencode {
     pub fn encode(&self, out: &mut dyn Write) -> io::Result<()> {
-        fn dump_string(out: &mut dyn Write, x: &[u8]) -> io::Result<()> {
-            out.write_all(itoa::Buffer::new().format(x.len()).as_bytes())?;
+        fn encode_string(bytes: &[u8], out: &mut dyn Write) -> io::Result<()> {
+            out.write_all(itoa::Buffer::new().format(bytes.len()).as_bytes())?;
             out.write_all(b":")?;
-            out.write_all(x)?;
+            out.write_all(bytes)?;
             Ok(())
         }
 
@@ -107,9 +107,7 @@ impl Bencode {
                 out.write_all(itoa::Buffer::new().format(*x).as_bytes())?;
                 out.write_all(b"e")?;
             }
-            Bencode::Bytes(x) => {
-                dump_string(out, x)?;
-            }
+            Bencode::Bytes(x) => encode_string(x, out)?,
             Bencode::List(x) => {
                 out.write_all(b"l")?;
                 for v in x {
@@ -120,7 +118,7 @@ impl Bencode {
             Bencode::Dict(x) => {
                 out.write_all(b"d")?;
                 for (k, v) in x {
-                    dump_string(out, k)?;
+                    encode_string(k, out)?;
                     v.encode(out)?;
                 }
                 out.write_all(b"e")?;
@@ -129,6 +127,17 @@ impl Bencode {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<(Bencode, &[u8]), BoxedError> {
+        fn decode_string(bytes: &[u8]) -> Result<(Vec<u8>, &[u8]), BoxedError> {
+            let (len, pos) = usize::from_radix_10(bytes);
+            let [b':', bytes @ ..] = &bytes[pos..] else {
+                Err("Missing ':' byte")?
+            };
+            match bytes.split_at_checked(len) {
+                Some((bytes, rest)) => Ok((bytes.to_vec(), rest)),
+                None => Err(format!("String length {len} exceeds remaining bytes"))?,
+            }
+        }
+
         match bytes {
             [b'i', bytes @ ..] => {
                 let (int, pos) = i64::from_radix_10_signed(bytes);
@@ -140,7 +149,7 @@ impl Bencode {
             }
             bytes @ [b'0'..=b'9', ..] => {
                 let (string, bytes) = decode_string(bytes)?;
-                Ok((Bencode::Bytes(string.to_vec()), bytes))
+                Ok((Bencode::Bytes(string), bytes))
             }
             [b'l', bytes @ ..] => {
                 let mut bytes = bytes;
@@ -165,24 +174,13 @@ impl Bencode {
                     let val;
                     (key, bytes) = decode_string(bytes)?;
                     (val, bytes) = Bencode::decode(bytes)?;
-                    dict.insert(key.to_vec(), val);
+                    dict.insert(key, val);
                 }
             }
             [byte, ..] => Err(format!("Unexpected byte '{byte}'"))?,
             [] => Err("Unexpected end of input")?,
         }
     }
-}
-
-fn decode_string(bytes: &[u8]) -> Result<(&[u8], &[u8]), BoxedError> {
-    let (len, pos) = usize::from_radix_10(bytes);
-    let [b':', bytes @ ..] = &bytes[pos..] else {
-        Err("Missing ':' byte")?
-    };
-    let Some(pair) = bytes.split_at_checked(len) else {
-        Err(format!("String length {len} exceeds remaining bytes"))?
-    };
-    Ok(pair)
 }
 
 #[cfg(test)]
