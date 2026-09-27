@@ -33,61 +33,39 @@ impl Bencode {
             Bencode::Dict(_) => "dict",
         }
     }
-
-    pub fn try_into_list(self) -> Result<Vec<Bencode>, String> {
-        match self {
-            Bencode::List(x) => Ok(x),
-            _ => Err(format!("Expected a list, got {}", self.get_type())),
-        }
-    }
-
-    pub fn try_into_int(self) -> Result<i64, String> {
-        match self {
-            Bencode::Int(x) => Ok(x),
-            _ => Err(format!("Expected an int, got {}", self.get_type())),
-        }
-    }
-
-    pub fn try_into_bytes(self) -> Result<Vec<u8>, String> {
-        match self {
-            Bencode::Bytes(x) => Ok(x),
-            _ => Err(format!("Expected bytes, got {}", self.get_type())),
-        }
-    }
-
-    pub fn try_into_dict(self) -> Result<BTreeMap<Vec<u8>, Bencode>, String> {
-        match self {
-            Bencode::Dict(x) => Ok(x),
-            _ => Err(format!("Expected a dict, got {}", self.get_type())),
-        }
-    }
 }
 
 impl TryFrom<Bencode> for i64 {
     type Error = String;
     fn try_from(value: Bencode) -> Result<Self, Self::Error> {
-        value.try_into_int()
+        match value {
+            Bencode::Int(x) => Ok(x),
+            _ => Err(format!("Expected an int, got {}", value.get_type())),
+        }
     }
 }
 
 impl TryFrom<Bencode> for usize {
     type Error = BoxedError;
     fn try_from(value: Bencode) -> Result<Self, Self::Error> {
-        Ok(value.try_into_int()?.try_into()?)
+        Ok(i64::try_from(value)?.try_into()?)
     }
 }
 
 impl TryFrom<Bencode> for Vec<u8> {
     type Error = String;
     fn try_from(value: Bencode) -> Result<Self, Self::Error> {
-        value.try_into_bytes()
+        match value {
+            Bencode::Bytes(x) => Ok(x),
+            _ => Err(format!("Expected bytes, got {}", value.get_type())),
+        }
     }
 }
 
 impl TryFrom<Bencode> for String {
     type Error = BoxedError;
     fn try_from(value: Bencode) -> Result<Self, Self::Error> {
-        Ok(value.try_into_bytes()?.try_into()?)
+        Ok(String::from_utf8(Vec::<u8>::try_from(value)?)?)
     }
 }
 
@@ -97,28 +75,24 @@ where
 {
     type Error = BoxedError;
     fn try_from(value: Bencode) -> Result<Self, Self::Error> {
-        Ok(value
-            .try_into_list()?
-            .into_iter()
-            .map(T::try_from)
-            .collect::<Result<_, _>>()?)
+        match value {
+            Bencode::List(x) => Ok(x.into_iter().map(T::try_from).collect::<Result<_, _>>()?),
+            _ => Err(format!("Expected a list, got {}", value.get_type()))?,
+        }
     }
 }
 
 impl TryFrom<Bencode> for BTreeMap<Vec<u8>, Bencode> {
     type Error = String;
     fn try_from(value: Bencode) -> Result<Self, Self::Error> {
-        value.try_into_dict()
+        match value {
+            Bencode::Dict(x) => Ok(x),
+            _ => Err(format!("Expected a dict, got {}", value.get_type())),
+        }
     }
 }
 
 impl Bencode {
-    pub fn encode_to_vec(&self) -> Vec<u8> {
-        let mut vec = Vec::new();
-        self.encode(&mut vec).unwrap();
-        vec
-    }
-
     pub fn encode(&self, out: &mut dyn Write) -> io::Result<()> {
         fn dump_string(out: &mut dyn Write, x: &[u8]) -> io::Result<()> {
             out.write_all(itoa::Buffer::new().format(x.len()).as_bytes())?;
@@ -217,7 +191,8 @@ mod tests {
 
     fn check_encode_decode(bytes: &[u8], value: Bencode, trailing: &[u8]) {
         assert_eq!(Bencode::decode(bytes).unwrap(), (value.clone(), trailing));
-        let mut encoded = value.encode_to_vec();
+        let mut encoded = Vec::new();
+        value.encode(&mut encoded).unwrap();
         encoded.extend_from_slice(trailing);
         assert_eq!(encoded, bytes);
     }

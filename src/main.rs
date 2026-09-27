@@ -82,7 +82,9 @@ impl Display for Sha1Hash {
 }
 
 fn get_info_hash(info: &Bencode) -> Sha1Hash {
-    Sha1Hash(Sha1::digest(&info.encode_to_vec()).into())
+    let mut buf = Vec::new();
+    info.encode(&mut buf).unwrap();
+    Sha1Hash(Sha1::digest(&buf).into())
 }
 
 impl TryFrom<Bencode> for Torrent {
@@ -96,8 +98,7 @@ impl TryFrom<Bencode> for Torrent {
         let files: Vec<(Vec<String>, usize)> = if let Ok(length) = info.remove_key("length") {
             vec![(vec![], length.try_into()?)]
         } else {
-            info.remove_key("files")?
-                .try_into_list()?
+            Vec::<Bencode>::try_from(info.remove_key("files")?)?
                 .into_iter()
                 .map(|mut file| {
                     Ok((
@@ -124,9 +125,7 @@ impl TryFrom<Bencode> for Torrent {
                     (path, length)
                 })
                 .collect(),
-            pieces: info
-                .remove_key("pieces")?
-                .try_into_bytes()?
+            pieces: Vec::<u8>::try_from(info.remove_key("pieces")?)?
                 .chunks(20)
                 .map(<[u8; 20]>::try_from)
                 .map(|r| r.map(Sha1Hash))
