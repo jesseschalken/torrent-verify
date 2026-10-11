@@ -21,17 +21,18 @@ impl Bencode {
             Bencode::Dict(dict) => dict
                 .remove(key.as_bytes())
                 .ok_or_else(|| format!("Key '{key}' not found")),
-            _ => Err(format!("Expected a dict, got {}", self.get_type())),
+            _ => Err(self.cast_error("dict")),
         }
     }
 
-    pub fn get_type(&self) -> &str {
-        match self {
+    fn cast_error(&self, expected: &'static str) -> String {
+        let self_type = match self {
             Bencode::Int(_) => "int",
             Bencode::Bytes(_) => "bytes",
             Bencode::List(_) => "list",
             Bencode::Dict(_) => "dict",
-        }
+        };
+        format!("Expected a {expected}, got {self_type}")
     }
 }
 
@@ -40,7 +41,7 @@ impl TryFrom<Bencode> for i64 {
     fn try_from(value: Bencode) -> Result<Self, Self::Error> {
         match value {
             Bencode::Int(x) => Ok(x),
-            _ => Err(format!("Expected an int, got {}", value.get_type())),
+            _ => Err(value.cast_error("int")),
         }
     }
 }
@@ -57,7 +58,7 @@ impl TryFrom<Bencode> for Vec<u8> {
     fn try_from(value: Bencode) -> Result<Self, Self::Error> {
         match value {
             Bencode::Bytes(x) => Ok(x),
-            _ => Err(format!("Expected bytes, got {}", value.get_type())),
+            _ => Err(value.cast_error("bytes")),
         }
     }
 }
@@ -77,7 +78,7 @@ where
     fn try_from(value: Bencode) -> Result<Self, Self::Error> {
         match value {
             Bencode::List(x) => Ok(x.into_iter().map(T::try_from).collect::<Result<_, _>>()?),
-            _ => Err(format!("Expected a list, got {}", value.get_type()))?,
+            _ => Err(value.cast_error("list"))?,
         }
     }
 }
@@ -87,7 +88,7 @@ impl TryFrom<Bencode> for BTreeMap<Vec<u8>, Bencode> {
     fn try_from(value: Bencode) -> Result<Self, Self::Error> {
         match value {
             Bencode::Dict(x) => Ok(x),
-            _ => Err(format!("Expected a dict, got {}", value.get_type())),
+            _ => Err(value.cast_error("dict")),
         }
     }
 }

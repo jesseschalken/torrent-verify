@@ -35,7 +35,7 @@ struct JustTorrents {
     torrent_files: Vec<PathBuf>,
     /// Replace characters that are invalid on Windows (e.g. <, >, :, ", |, ?, *) with underscores
     #[arg(long, default_value_t = cfg!(windows), help_heading = Some("Path fixing"))]
-    fix_windows_paths: bool,
+    windows_paths: bool,
     /// Normalize Unicode paths (NFC, or NFD on macOS/iOS)
     #[arg(long, default_value_t = true, help_heading = Some("Path fixing"))]
     normalize_utf8_paths: bool,
@@ -104,10 +104,9 @@ impl TryFrom<Bencode> for Torrent {
 
         let name: String = info.remove_key("name")?.try_into()?;
 
-        let files: Vec<(Vec<String>, usize)> = if let Ok(length) = info.remove_key("length") {
-            vec![(vec![], length.try_into()?)]
-        } else {
-            Vec::<Bencode>::try_from(info.remove_key("files")?)?
+        let files: Vec<(Vec<String>, usize)> = match info.remove_key("length") {
+            Ok(length) => vec![(vec![], length.try_into()?)],
+            Err(_) => Vec::<Bencode>::try_from(info.remove_key("files")?)?
                 .into_iter()
                 .map(|mut file| {
                     Ok((
@@ -115,7 +114,7 @@ impl TryFrom<Bencode> for Torrent {
                         file.remove_key("length")?.try_into()?,
                     ))
                 })
-                .collect::<Result<_, Error>>()?
+                .collect::<Result<_, Error>>()?,
         };
 
         Ok(Torrent {
@@ -135,10 +134,12 @@ impl TryFrom<Bencode> for Torrent {
                 })
                 .collect(),
             pieces: Vec::<u8>::try_from(info.remove_key("pieces")?)?
-                .chunks(20)
-                .map(<[u8; 20]>::try_from)
-                .map(|r| r.map(Sha1Hash))
-                .collect::<Result<Vec<_>, _>>()?,
+                .as_chunks::<20>()
+                .0
+                .into_iter()
+                .copied()
+                .map(Sha1Hash)
+                .collect(),
             piece_size: info.remove_key("piece length")?.try_into()?,
         })
     }
@@ -233,7 +234,7 @@ fn read_torrents(opts: &JustTorrents) -> Result<Vec<(PathBuf, Torrent)>, Error> 
             let bytes = fs::read(&path)?;
             let (value, _) = Bencode::decode(&bytes)?;
             let mut torrent: Torrent = value.try_into()?;
-            if opts.fix_windows_paths {
+            if opts.windows_paths {
                 torrent.fix_windows_paths();
             }
             if opts.normalize_utf8_paths {
@@ -248,24 +249,28 @@ fn with_partial_files(path: Cow<str>) -> impl Iterator<Item = Cow<str>> {
     [path.clone(), path.clone() + ".part", path + ".!qB"].into_iter()
 }
 
-fn read_torrent_files(torrent: &Torrent, data_dir: &Path) -> io::Result<Vec<Sha1Hash>> {
-    let mmaps = torrent
-        .files
+fn read_torrent_files(
+    Torrent {
+        files, piece_size, ..
+    }: &Torrent,
+    data_dir: &Path,
+) -> io::Result<Vec<Sha1Hash>> {
+    let mmaps = files
         .iter()
         .map(|(path, size)| {
-            let mmap = with_partial_files(path.into())
+            with_partial_files(path.into())
                 .flat_map(|path| match File::open(data_dir.join(&*path)) {
                     Err(e) if e.kind() == ErrorKind::NotFound => None,
                     x => Some(x),
                 })
                 .map(|file| unsafe { Mmap::map(&file?) })
                 .next()
-                .transpose()?;
-            Ok((mmap, *size))
+                .transpose()
+                .map(|mmap| (mmap, *size))
         })
         .collect::<io::Result<Vec<_>>>()?;
 
-    let results = mmaps
+    Ok(mmaps
         .iter()
         .flat_map(|(mmap, size)| {
             mmap.as_deref()
@@ -287,22 +292,21 @@ fn read_torrent_files(torrent: &Torrent, data_dir: &Path) -> io::Result<Vec<Sha1
         .peekable()
         .batching(|slices| {
             let mut hash = Sha1::default();
-            let max = torrent.piece_size;
             let mut done = 0;
 
             // Take any slices that are <= the bytes we need for this piece
-            while let Some(slice) = slices.next_if(|s| s.len() <= (max - done)) {
+            while let Some(slice) = slices.next_if(|s| s.len() <= (piece_size - done)) {
                 done += slice.len();
                 hash.update(slice);
             }
 
             // If there is a slice remaining bigger than we need, take as much as
             // possible and leave behind the unused bytes
-            if done != max
+            if done != *piece_size
                 && let Some(slice) = slices.peek_mut()
             {
                 let bytes;
-                (bytes, *slice) = slice.split_at(max - done);
+                (bytes, *slice) = slice.split_at(piece_size - done);
                 done += bytes.len();
                 hash.update(bytes);
             }
@@ -312,65 +316,75 @@ fn read_torrent_files(torrent: &Torrent, data_dir: &Path) -> io::Result<Vec<Sha1
                 _ => Some(Sha1Hash(hash.finalize().into())),
             }
         })
-        .collect_vec();
-
-    assert_eq!(torrent.pieces.len(), results.len());
-
-    Ok(results)
+        .collect())
 }
 
 fn check_file_contents(torrents: &[(PathBuf, Torrent)], data_dir: &Path) -> Result<(), Error> {
     torrents
         .into_par_iter()
         .with_max_len(1)
-        .map(|(name, torrent)| -> Result<_, _> {
-            let any_files_exist = torrent
-                .files
-                .iter()
-                .flat_map(|(path, _size)| with_partial_files(path.into()))
-                .any(|path| data_dir.join(&*path).exists());
-
-            let matches = if !any_files_exist {
-                torrent.pieces.iter().map(|_| false).collect()
-            } else {
-                read_torrent_files(torrent, data_dir)?
+        .map(
+            |(name, torrent @ Torrent { files, pieces, .. })| -> Result<_, _> {
+                let any_files_exist = files
                     .iter()
-                    .zip_eq(torrent.pieces.iter())
-                    .map(|(a, b)| a == b)
-                    .collect_vec()
-            };
+                    .flat_map(|(path, _size)| with_partial_files(path.into()))
+                    .any(|path| data_dir.join(&*path).exists());
 
-            let num_matches = matches.iter().filter(|x| **x).count();
-            let percent = (num_matches as f64) * 100f64 / torrent.pieces.len() as f64;
-            let percent = (percent * 100f64).round() / 100f64; // Round down to 2 decimal places
+                let matches = if !any_files_exist {
+                    vec![false; pieces.len()]
+                } else {
+                    read_torrent_files(torrent, data_dir)?
+                        .iter()
+                        .zip_eq(pieces.iter())
+                        .map(|(a, b)| a == b)
+                        .collect_vec()
+                };
 
-            let progress: String = compress(&matches, 20).map(char_for).collect();
+                let percent = count_true(&matches) * 10000 / pieces.len();
 
-            println!("{: >8.2}%  {}  {}", percent, progress, name.display());
+                let progress: String = match percent {
+                    10000 if SHOW_COMPLETE => format!("{:─^20}", "COMPLETE"),
+                    _ => compress(&matches, 20)
+                        .map(|x| CHARS[count_true(x) * (CHARS.len() - 1) / x.len()])
+                        .collect(),
+                };
 
-            Ok(())
-        })
+                println!(
+                    "{: >8.2}%  {}  {}",
+                    (percent as f64) / 100f64,
+                    progress,
+                    name.display()
+                );
+
+                Ok(())
+            },
+        )
         .collect()
 }
 
-fn char_for(bools: &[bool]) -> char {
-    if bools.iter().filter(|x| **x).count() > bools.len() / 2 {
-        '●'
-    } else {
-        '○'
-    }
+const SHOW_COMPLETE: bool = true;
+const CHARS: &[char] = &[' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+// const CHARS: &[char] = &['○', '●'];
+// const CHARS: &[char] = &['·', '•'];
+// const CHARS: &[char] = &[' ', '•'];
+
+fn count_true(bools: &[bool]) -> usize {
+    bools.iter().filter(|x| **x).count()
 }
 
+/// Group the bools into `size` groups
 fn compress(bools: &[bool], size: usize) -> impl Iterator<Item = &[bool]> {
+    let n = bools.len();
+
     (0..size).map(move |i| {
-        let [i, j] = [i, i + 1].map(|i| i * bools.len() / size);
-        if i == j && j < bools.len() {
-            &bools[i..j + 1]
-        } else if i == j && i > 0 {
-            &bools[i - 1..j]
-        } else {
-            &bools[i..j]
-        }
+        let [i, j] = [i, i + 1].map(|i| i * n / size);
+
+        &bools[match j - i {
+            // Make sure the range isn't empty if there is space either side
+            0 if j != n => i..j + 1,
+            0 if i != 0 => i - 1..j,
+            _ => i..j,
+        }]
     })
 }
 
