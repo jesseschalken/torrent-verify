@@ -30,7 +30,7 @@ struct Cli {
 }
 
 #[derive(Parser, Debug)]
-struct JustTorrents {
+struct TorrentArgs {
     /// Path to a torrent file or a directory containing torrent files
     torrent_files: Vec<PathBuf>,
     /// Replace characters that are invalid on Windows (e.g. <, >, :, ", |, ?, *) with underscores
@@ -41,10 +41,45 @@ struct JustTorrents {
     normalize_utf8_paths: bool,
 }
 
+impl TorrentArgs {
+    fn read_torrents(&self) -> Result<Vec<(PathBuf, Torrent)>, Error> {
+        self.torrent_files
+            .iter()
+            .map(|path| {
+                if path.is_dir() {
+                    ReadDirRecursive::new(path)?
+                        .filter(|path| match path {
+                            Ok(path) => path.extension() == Some(OsStr::new("torrent")),
+                            _ => true,
+                        })
+                        .collect()
+                } else {
+                    Ok(vec![path.clone()])
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_par_iter()
+            .flatten()
+            .map(|path| {
+                let bytes = fs::read(&path)?;
+                let (value, _) = Bencode::decode(&bytes)?;
+                let mut torrent: Torrent = value.try_into()?;
+                if self.windows_paths {
+                    torrent.fix_windows_paths();
+                }
+                if self.normalize_utf8_paths {
+                    torrent.normalize_utf8_paths();
+                }
+                Ok((path, torrent))
+            })
+            .collect()
+    }
+}
+
 #[derive(Parser, Debug)]
-struct TorrentsAndData {
+struct TorrentsAndDataArgs {
     #[command(flatten)]
-    torrents: JustTorrents,
+    torrents: TorrentArgs,
     /// Path to the directory containing the downloaded data
     #[arg(short, long = "data")]
     data_dir: PathBuf,
@@ -53,17 +88,17 @@ struct TorrentsAndData {
 #[derive(Subcommand, Debug)]
 enum Subcommand {
     #[command(about = "Verify downloaded torrent data")]
-    Verify(TorrentsAndData),
+    Verify(TorrentsAndDataArgs),
     #[command(about = "List files in the data directory that don't belong to a torrent file")]
-    Unowned(TorrentsAndData),
+    Unowned(TorrentsAndDataArgs),
     #[command(about = "List files for each torrent that are missing in the data directory")]
-    Missing(TorrentsAndData),
+    Missing(TorrentsAndDataArgs),
     #[command(about = "Dump information about the provided torrent files")]
-    Dump(JustTorrents),
+    Dump(TorrentArgs),
     #[command(about = "Get the info-hash of each provided torrent file")]
-    InfoHash(JustTorrents),
+    InfoHash(TorrentArgs),
     #[command(about = "List the files owned by the provided torrent files")]
-    Files(JustTorrents),
+    Files(TorrentArgs),
 }
 
 #[derive(Debug)]
@@ -164,6 +199,108 @@ impl Torrent {
             *path = normalize_utf8(path);
         }
     }
+
+    fn read_files(&self, data_dir: &Path) -> io::Result<Vec<Sha1Hash>> {
+        let mmaps = self
+            .files
+            .iter()
+            .map(|(path, size)| {
+                with_partial_files(path.into())
+                    .flat_map(|path| match File::open(data_dir.join(&*path)) {
+                        Err(e) if e.kind() == ErrorKind::NotFound => None,
+                        x => Some(x),
+                    })
+                    .map(|file| unsafe { Mmap::map(&file?) })
+                    .next()
+                    .transpose()
+                    .map(|mmap| (mmap, *size))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+
+        Ok(mmaps
+            .iter()
+            .flat_map(|(mmap, size)| {
+                mmap.as_deref()
+                    .into_iter()
+                    // Add infinite slices of zeros (SHA1 processes in 64 byte blocks)
+                    .chain(repeat(&[0; 64][..]))
+                    // Take only up to the size we need for this file
+                    .scan(*size, |need, mut slice| match need {
+                        0 => None,
+                        _ => {
+                            if slice.len() > *need {
+                                slice = &slice[..*need];
+                            }
+                            *need -= slice.len();
+                            Some(slice)
+                        }
+                    })
+            })
+            .peekable()
+            .batching(|slices| {
+                let mut hash = Sha1::default();
+                let mut done = 0;
+
+                // Take any slices that are <= the bytes we need for this piece
+                while let Some(slice) = slices.next_if(|s| s.len() <= (self.piece_size - done)) {
+                    done += slice.len();
+                    hash.update(slice);
+                }
+
+                // If there is a slice remaining bigger than we need, take as much as
+                // possible and leave behind the unused bytes
+                if done != self.piece_size
+                    && let Some(slice) = slices.peek_mut()
+                {
+                    let bytes;
+                    (bytes, *slice) = slice.split_at(self.piece_size - done);
+                    done += bytes.len();
+                    hash.update(bytes);
+                }
+
+                match done {
+                    0 => None,
+                    _ => Some(Sha1Hash(hash.finalize().into())),
+                }
+            })
+            .collect())
+    }
+
+    fn check_files(&self, name: &Path, data_dir: &Path) -> io::Result<()> {
+        let any_files_exist = self
+            .files
+            .iter()
+            .flat_map(|(path, _size)| with_partial_files(path.into()))
+            .any(|path| data_dir.join(&*path).exists());
+
+        let matches = if !any_files_exist {
+            vec![false; self.pieces.len()]
+        } else {
+            self.read_files(data_dir)?
+                .iter()
+                .zip_eq(self.pieces.iter())
+                .map(|(a, b)| a == b)
+                .collect_vec()
+        };
+
+        let percent = count_true(&matches) * 10000 / self.pieces.len();
+
+        let progress: String = match percent {
+            10000 if SHOW_COMPLETE => format!("{:─^20}", "COMPLETE"),
+            _ => compress(&matches, 20)
+                .map(|x| CHARS[count_true(x) * (CHARS.len() - 1) / x.len()])
+                .collect(),
+        };
+
+        println!(
+            "{: >8.2}%  {}  {}",
+            (percent as f64) / 100f64,
+            progress,
+            name.display()
+        );
+
+        Ok(())
+    }
 }
 
 fn normalize_utf8(s: &str) -> String {
@@ -179,6 +316,10 @@ fn normalize_utf8(s: &str) -> String {
 struct ReadDirRecursive(Vec<ReadDir>);
 
 impl ReadDirRecursive {
+    fn new(dir: &Path) -> io::Result<Self> {
+        Ok(Self(vec![dir.read_dir()?]))
+    }
+
     fn next_or_error(&mut self) -> io::Result<Option<PathBuf>> {
         while let Some(iter) = self.0.last_mut() {
             if let Some(entry) = iter.next() {
@@ -203,163 +344,8 @@ impl Iterator for ReadDirRecursive {
     }
 }
 
-fn read_dir_recursive(dir: &Path) -> io::Result<ReadDirRecursive> {
-    Ok(ReadDirRecursive(vec![dir.read_dir()?]))
-}
-
-fn find_torrents(dir: &Path) -> io::Result<Vec<PathBuf>> {
-    read_dir_recursive(dir)?
-        .into_iter()
-        .filter(|path| match path {
-            Ok(path) => path.extension() == Some(OsStr::new("torrent")),
-            _ => true,
-        })
-        .collect()
-}
-
-fn read_torrents(opts: &JustTorrents) -> Result<Vec<(PathBuf, Torrent)>, Error> {
-    opts.torrent_files
-        .iter()
-        .map(|path| {
-            if path.is_dir() {
-                find_torrents(&path)
-            } else {
-                Ok(vec![path.clone()])
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .into_par_iter()
-        .flatten()
-        .map(|path| {
-            let bytes = fs::read(&path)?;
-            let (value, _) = Bencode::decode(&bytes)?;
-            let mut torrent: Torrent = value.try_into()?;
-            if opts.windows_paths {
-                torrent.fix_windows_paths();
-            }
-            if opts.normalize_utf8_paths {
-                torrent.normalize_utf8_paths();
-            }
-            Ok((path, torrent))
-        })
-        .collect()
-}
-
 fn with_partial_files(path: Cow<str>) -> impl Iterator<Item = Cow<str>> {
     [path.clone(), path.clone() + ".part", path + ".!qB"].into_iter()
-}
-
-fn read_torrent_files(
-    Torrent {
-        files, piece_size, ..
-    }: &Torrent,
-    data_dir: &Path,
-) -> io::Result<Vec<Sha1Hash>> {
-    let mmaps = files
-        .iter()
-        .map(|(path, size)| {
-            with_partial_files(path.into())
-                .flat_map(|path| match File::open(data_dir.join(&*path)) {
-                    Err(e) if e.kind() == ErrorKind::NotFound => None,
-                    x => Some(x),
-                })
-                .map(|file| unsafe { Mmap::map(&file?) })
-                .next()
-                .transpose()
-                .map(|mmap| (mmap, *size))
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-
-    Ok(mmaps
-        .iter()
-        .flat_map(|(mmap, size)| {
-            mmap.as_deref()
-                .into_iter()
-                // Add infinite slices of zeros (SHA1 processes in 64 byte blocks)
-                .chain(repeat(&[0; 64][..]))
-                // Take only up to the size we need for this file
-                .scan(*size, |need, mut slice| match need {
-                    0 => None,
-                    _ => {
-                        if slice.len() > *need {
-                            slice = &slice[..*need];
-                        }
-                        *need -= slice.len();
-                        Some(slice)
-                    }
-                })
-        })
-        .peekable()
-        .batching(|slices| {
-            let mut hash = Sha1::default();
-            let mut done = 0;
-
-            // Take any slices that are <= the bytes we need for this piece
-            while let Some(slice) = slices.next_if(|s| s.len() <= (piece_size - done)) {
-                done += slice.len();
-                hash.update(slice);
-            }
-
-            // If there is a slice remaining bigger than we need, take as much as
-            // possible and leave behind the unused bytes
-            if done != *piece_size
-                && let Some(slice) = slices.peek_mut()
-            {
-                let bytes;
-                (bytes, *slice) = slice.split_at(piece_size - done);
-                done += bytes.len();
-                hash.update(bytes);
-            }
-
-            match done {
-                0 => None,
-                _ => Some(Sha1Hash(hash.finalize().into())),
-            }
-        })
-        .collect())
-}
-
-fn check_file_contents(torrents: &[(PathBuf, Torrent)], data_dir: &Path) -> Result<(), Error> {
-    torrents
-        .into_par_iter()
-        .with_max_len(1)
-        .map(
-            |(name, torrent @ Torrent { files, pieces, .. })| -> Result<_, _> {
-                let any_files_exist = files
-                    .iter()
-                    .flat_map(|(path, _size)| with_partial_files(path.into()))
-                    .any(|path| data_dir.join(&*path).exists());
-
-                let matches = if !any_files_exist {
-                    vec![false; pieces.len()]
-                } else {
-                    read_torrent_files(torrent, data_dir)?
-                        .iter()
-                        .zip_eq(pieces.iter())
-                        .map(|(a, b)| a == b)
-                        .collect_vec()
-                };
-
-                let percent = count_true(&matches) * 10000 / pieces.len();
-
-                let progress: String = match percent {
-                    10000 if SHOW_COMPLETE => format!("{:─^20}", "COMPLETE"),
-                    _ => compress(&matches, 20)
-                        .map(|x| CHARS[count_true(x) * (CHARS.len() - 1) / x.len()])
-                        .collect(),
-                };
-
-                println!(
-                    "{: >8.2}%  {}  {}",
-                    (percent as f64) / 100f64,
-                    progress,
-                    name.display()
-                );
-
-                Ok(())
-            },
-        )
-        .collect()
 }
 
 const SHOW_COMPLETE: bool = true;
@@ -393,18 +379,24 @@ fn main() -> Result<(), Error> {
 
     match cli.command {
         Subcommand::Verify(args) => {
-            let torrents = read_torrents(&args.torrents)?;
-            check_file_contents(&torrents, &args.data_dir)?;
+            let torrents = args.torrents.read_torrents()?;
+            torrents
+                .into_par_iter()
+                .with_max_len(1)
+                .map(|(name, torrent)| torrent.check_files(&name, &args.data_dir))
+                .collect::<io::Result<Vec<_>>>()?;
         }
         Subcommand::Unowned(args) => {
-            let torrent_files: HashSet<_> = read_torrents(&args.torrents)?
+            let torrent_files: HashSet<_> = args
+                .torrents
+                .read_torrents()?
                 .into_iter()
-                .flat_map(|(_path, torrent)| torrent.files)
-                .flat_map(|(path, _size)| with_partial_files(path.into()))
+                .flat_map(|(_, torrent)| torrent.files)
+                .flat_map(|(path, _)| with_partial_files(path.into()))
                 .map(|path| args.data_dir.join(&*path))
                 .collect();
 
-            for file in read_dir_recursive(&args.data_dir)? {
+            for file in ReadDirRecursive::new(&args.data_dir)? {
                 let file = file?;
                 if file.file_name() == Some(OsStr::new(".DS_Store")) {
                     continue;
@@ -415,15 +407,15 @@ fn main() -> Result<(), Error> {
             }
         }
         Subcommand::Missing(args) => {
-            let existing: HashSet<PathBuf> = read_dir_recursive(&args.data_dir)?
+            let existing: HashSet<PathBuf> = ReadDirRecursive::new(&args.data_dir)?
                 .into_iter()
                 .collect::<io::Result<_>>()?;
 
-            for (path, torrent) in read_torrents(&args.torrents)? {
+            for (path, torrent) in args.torrents.read_torrents()? {
                 let missing = torrent
                     .files
                     .iter()
-                    .map(|(path, _size)| path)
+                    .map(|(path, _)| path)
                     .filter(|&path| {
                         !with_partial_files(path.into())
                             .any(|path| existing.contains(&args.data_dir.join(&*path)))
@@ -440,12 +432,12 @@ fn main() -> Result<(), Error> {
             }
         }
         Subcommand::Dump(args) => {
-            for (_, torrent) in read_torrents(&args)? {
+            for (_, torrent) in args.read_torrents()? {
                 println!("{:#?}", torrent);
             }
         }
         Subcommand::Files(args) => {
-            for (path, torrent) in read_torrents(&args)? {
+            for (path, torrent) in args.read_torrents()? {
                 println!("{}", path.display());
                 for (file, _) in torrent.files {
                     println!("  {}", file);
@@ -453,7 +445,7 @@ fn main() -> Result<(), Error> {
             }
         }
         Subcommand::InfoHash(args) => {
-            for (path, torrent) in read_torrents(&args)? {
+            for (path, torrent) in args.read_torrents()? {
                 println!("{}  {}", torrent.info_hash, path.display())
             }
         }
