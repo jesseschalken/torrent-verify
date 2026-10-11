@@ -12,10 +12,10 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt::{Debug, Display, Formatter};
-use std::fs::{File, ReadDir};
+use std::fs::File;
 use std::io::ErrorKind;
-use std::iter::once;
 use std::iter::repeat;
+use std::iter::{from_fn, once};
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 use unicode_normalization::UnicodeNormalization;
@@ -47,7 +47,7 @@ impl TorrentArgs {
             .iter()
             .map(|path| {
                 if path.is_dir() {
-                    ReadDirRecursive::new(path)?
+                    read_dir_recursive(path)?
                         .filter(|path| match path {
                             Ok(path) => path.extension() == Some(OsStr::new("torrent")),
                             _ => true,
@@ -216,46 +216,36 @@ impl Torrent {
                     .map(|mmap| (mmap, *size))
             })
             .collect::<io::Result<Vec<_>>>()?;
+        let mut carry: &[u8] = &[];
 
         Ok(mmaps
             .iter()
             .flat_map(|(mmap, size)| {
                 mmap.as_deref()
                     .into_iter()
-                    // Add infinite slices of zeros (SHA1 processes in 64 byte blocks)
-                    .chain(repeat(&[0; 64][..]))
-                    // Take only up to the size we need for this file
-                    .scan(*size, |need, mut slice| match need {
+                    // A large buffer here reduces the number of hashing loops for large missing files
+                    .chain(repeat(&[0; 8192][..]))
+                    .scan(*size, |need, slice| match need {
                         0 => None,
                         _ => {
-                            if slice.len() > *need {
-                                slice = &slice[..*need];
-                            }
-                            *need -= slice.len();
-                            Some(slice)
+                            let i = (*need).min(slice.len());
+                            *need -= i;
+                            Some(&slice[..i])
                         }
                     })
             })
-            .peekable()
             .batching(|slices| {
                 let mut hash = Sha1::default();
                 let mut done = 0;
 
-                // Take any slices that are <= the bytes we need for this piece
-                while let Some(slice) = slices.next_if(|s| s.len() <= (self.piece_size - done)) {
-                    done += slice.len();
-                    hash.update(slice);
-                }
-
-                // If there is a slice remaining bigger than we need, take as much as
-                // possible and leave behind the unused bytes
-                if done != self.piece_size
-                    && let Some(slice) = slices.peek_mut()
-                {
-                    let bytes;
-                    (bytes, *slice) = slice.split_at(self.piece_size - done);
-                    done += bytes.len();
-                    hash.update(bytes);
+                for slice in once(carry).chain(slices) {
+                    let i = (self.piece_size - done).min(slice.len());
+                    done += i;
+                    hash.update(&slice[..i]);
+                    carry = &slice[i..];
+                    if !carry.is_empty() {
+                        break;
+                    }
                 }
 
                 match done {
@@ -313,35 +303,21 @@ fn normalize_utf8(s: &str) -> String {
     }
 }
 
-struct ReadDirRecursive(Vec<ReadDir>);
-
-impl ReadDirRecursive {
-    fn new(dir: &Path) -> io::Result<Self> {
-        Ok(Self(vec![dir.read_dir()?]))
-    }
-
-    fn next_or_error(&mut self) -> io::Result<Option<PathBuf>> {
-        while let Some(iter) = self.0.last_mut() {
-            if let Some(entry) = iter.next() {
-                let ref entry = entry?;
-                if entry.file_type()?.is_dir() {
-                    self.0.push(entry.path().read_dir()?);
-                } else {
-                    return Ok(Some(entry.path()));
+fn read_dir_recursive(dir: &Path) -> io::Result<impl Iterator<Item = io::Result<PathBuf>>> {
+    let mut stack = vec![dir.read_dir()?];
+    let mut next = move || {
+        while let Some(iter) = stack.last_mut() {
+            match &iter.next().transpose()? {
+                Some(d) if d.file_type()?.is_dir() => {
+                    stack.push(d.path().read_dir()?);
                 }
-            } else {
-                self.0.pop();
+                Some(f) => return Ok(Some(f.path())),
+                None => drop(stack.pop()),
             }
         }
         Ok(None)
-    }
-}
-
-impl Iterator for ReadDirRecursive {
-    type Item = io::Result<PathBuf>;
-    fn next(&mut self) -> Option<Self::Item> {
-        self.next_or_error().transpose()
-    }
+    };
+    Ok(from_fn(move || next().transpose()))
 }
 
 fn with_partial_files(path: Cow<str>) -> impl Iterator<Item = Cow<str>> {
@@ -396,7 +372,7 @@ fn main() -> Result<(), Error> {
                 .map(|path| args.data_dir.join(&*path))
                 .collect();
 
-            for file in ReadDirRecursive::new(&args.data_dir)? {
+            for file in read_dir_recursive(&args.data_dir)? {
                 let file = file?;
                 if file.file_name() == Some(OsStr::new(".DS_Store")) {
                     continue;
@@ -407,9 +383,8 @@ fn main() -> Result<(), Error> {
             }
         }
         Subcommand::Missing(args) => {
-            let existing: HashSet<PathBuf> = ReadDirRecursive::new(&args.data_dir)?
-                .into_iter()
-                .collect::<io::Result<_>>()?;
+            let existing: HashSet<PathBuf> =
+                read_dir_recursive(&args.data_dir)?.collect::<io::Result<_>>()?;
 
             for (path, torrent) in args.torrents.read_torrents()? {
                 let missing = torrent
